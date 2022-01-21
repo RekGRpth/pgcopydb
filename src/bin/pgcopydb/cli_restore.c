@@ -36,7 +36,8 @@ static CommandLine restore_schema_command =
 		" --source <dir> --target <URI> ",
 		"  --source          Directory where to find the schema custom files\n"
 		"  --target          Postgres URI to the source database\n"
-		"  --drop-if-exists  On the target database, clean-up from a previous run first\n",
+		"  --drop-if-exists  On the target database, clean-up from a previous run first\n"
+		"  --no-owner        Do not set ownership of objects to match the original database\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema);
 
@@ -47,7 +48,8 @@ static CommandLine restore_schema_pre_data_command =
 		" --source <dir> --target <URI> ",
 		"  --source          Directory where to find the schema custom files\n"
 		"  --target          Postgres URI to the source database\n"
-		"  --drop-if-exists  On the target database, clean-up from a previous run first\n",
+		"  --drop-if-exists  On the target database, clean-up from a previous run first\n"
+		"  --no-owner        Do not set ownership of objects to match the original database\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema_pre_data);
 
@@ -57,7 +59,8 @@ static CommandLine restore_schema_post_data_command =
 		"Restore a database post-data schema from custom file to target database",
 		" --source <dir> --target <URI> ",
 		"  --source          Directory where to find the schema custom files\n"
-		"  --target          Postgres URI to the source database\n",
+		"  --target          Postgres URI to the source database\n"
+		"  --no-owner        Do not set ownership of objects to match the original database\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema_post_data);
 
@@ -89,6 +92,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "target", required_argument, NULL, 'T' },
 		{ "schema", required_argument, NULL, 's' },
 		{ "drop-if-exists", no_argument, NULL, 'c' }, /* pg_restore -c */
+		{ "no-owner", no_argument, NULL, 'O' },       /* pg_restore -O */
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -98,7 +102,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 
 	optind = 0;
 
-	while ((c = getopt_long(argc, argv, "S:T:cVvqh",
+	while ((c = getopt_long(argc, argv, "S:T:cOVvqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -127,6 +131,13 @@ cli_restore_schema_getopts(int argc, char **argv)
 			{
 				options.dropIfExists = true;
 				log_trace("--drop-if-exists");
+				break;
+			}
+
+			case 'O':
+			{
+				options.noOwner = true;
+				log_trace("--no-owner");
 				break;
 			}
 
@@ -176,12 +187,6 @@ cli_restore_schema_getopts(int argc, char **argv)
 				break;
 			}
 		}
-	}
-
-	if (IS_EMPTY_STRING_BUFFER(options.source_dir))
-	{
-		log_fatal("Option --source is mandatory");
-		++errors;
 	}
 
 	/* restore commands support the target URI environment variable */
@@ -309,35 +314,42 @@ cli_restore_schema_post_data(int argc, char **argv)
 static void
 cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 {
-	CopyFilePaths cfPaths = { 0 };
-	PostgresPaths pgPaths = { 0 };
+	CopyFilePaths *cfPaths = &(copySpecs->cfPaths);
+	PostgresPaths *pgPaths = &(copySpecs->pgPaths);
 
-	log_info("Restoring database from \"%s\"", restoreDBoptions.source_dir);
-	log_info("Restoring database into \"%s\"",
-			 restoreDBoptions.target_pguri);
+	(void) find_pg_commands(pgPaths);
 
-	(void) find_pg_commands(&pgPaths);
+	char *dir =
+		IS_EMPTY_STRING_BUFFER(restoreDBoptions.source_dir)
+		? NULL
+		: restoreDBoptions.source_dir;
 
-	if (!copydb_init_workdir(&cfPaths, restoreDBoptions.source_dir))
+	bool removeDir = false;
+
+	if (!copydb_init_workdir(cfPaths, dir, removeDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
-			 pgPaths.pg_version,
-			 pgPaths.pg_restore);
-
 	if (!copydb_init_specs(copySpecs,
-						   &cfPaths,
-						   &pgPaths,
 						   NULL, /* source_pguri */
 						   restoreDBoptions.target_pguri,
 						   1,    /* table jobs */
 						   1,    /* index jobs */
-						   restoreDBoptions.dropIfExists))
+						   DATA_SECTION_NONE,
+						   restoreDBoptions.dropIfExists,
+						   restoreDBoptions.noOwner,
+						   false)) /* skipLargeObjects */
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	log_info("Restoring database from \"%s\"", cfPaths->topdir);
+	log_info("Restoring database into \"%s\"", copySpecs->target_pguri);
+
+	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
+			 pgPaths->pg_version,
+			 pgPaths->pg_restore);
 }

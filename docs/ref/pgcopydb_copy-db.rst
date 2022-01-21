@@ -16,12 +16,13 @@ Postgres instance to the target Postgres instance.
    pgcopydb copy-db: Copy an entire database from source to target
    usage: pgcopydb copy-db  --source <URI> --target <URI> [ ... ]
 
-     --source          Postgres URI to the source database
-     --target          Postgres URI to the target database
-     --table-jobs      Number of concurrent COPY jobs to run
-     --index-jobs      Number of concurrent CREATE INDEX jobs to run
-     --drop-if-exists  On the target database, clean-up from a previous run first
-
+     --source              Postgres URI to the source database
+     --target              Postgres URI to the target database
+     --table-jobs          Number of concurrent COPY jobs to run
+     --index-jobs          Number of concurrent CREATE INDEX jobs to run
+     --drop-if-exists      On the target database, clean-up from a previous run first
+     --no-owner            Do not set ownership of objects to match the original database
+     --skip-large-objects  Skip copying large objects (blobs)
 
 Description
 -----------
@@ -51,15 +52,23 @@ The ``pgcopydb copy-db`` command implements the following steps:
 
      The primary indexes are created as UNIQUE indexes at this stage.
 
-     Then the PRIMARY KEY constraints are created USING the just built
+  5. Then the PRIMARY KEY constraints are created USING the just built
      indexes. This two-steps approach allows the primary key index itself to
      be created in parallel with other indexes on the same table, avoiding
      an EXCLUSIVE LOCK while creating the index.
 
-  5. Then ``VACUUM ANALYZE`` is run on each target table as soon as the data
+  6. Then ``VACUUM ANALYZE`` is run on each target table as soon as the data
      and indexes are all created.
 
-  6. The final stage consists now of running the rest of the ``post-data``
+  8. Then pgcopydb gets the list of the sequences on the source database and
+     for each of them runs a separate query on the source to fetch the
+     ``last_value`` and the ``is_called`` metadata the same way that pg_dump
+     does.
+
+     For each sequence, pgcopydb then calls ``pg_catalog.setval()`` on the
+     target database with the information obtained on the source database.
+
+  9. The final stage consists now of running the rest of the ``post-data``
      section script for the whole database, and that's where the foreign key
      constraints and other elements are created.
 
@@ -113,6 +122,21 @@ The following options are available to ``pgcopydb copy-db``:
 
   This option causes ``DROP TABLE`` and ``DROP INDEX`` and other DROP
   commands to be used. Make sure you understand what you're doing here!
+
+--no-owner
+
+  Do not output commands to set ownership of objects to match the original
+  database. By default, ``pg_restore`` issues ``ALTER OWNER`` or ``SET
+  SESSION AUTHORIZATION`` statements to set ownership of created schema
+  elements. These statements will fail unless the initial connection to the
+  database is made by a superuser (or the same user that owns all of the
+  objects in the script). With ``--no-owner``, any user name can be used for
+  the initial connection, and this user will own all the created objects.
+
+--skip-large-objects
+
+  Skip copying large objects, also known as blobs, when copying the data
+  from the source database to the target database.
 
 Environment
 -----------

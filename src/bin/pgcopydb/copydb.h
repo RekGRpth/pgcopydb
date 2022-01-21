@@ -8,6 +8,7 @@
 
 #include "lock_utils.h"
 #include "pgcmd.h"
+#include "pgsql.h"
 #include "schema.h"
 
 
@@ -74,14 +75,47 @@ typedef struct IndexFilePathsArray
 } IndexFilePathsArray;
 
 
+/*
+ * pgcopydb uses Postgres facility to export snapshot and re-use them in other
+ * transactions to use a consistent view of the data on the source database.
+ */
+typedef struct TransactionSnapshot
+{
+	PGSQL pgsql;
+	char pguri[MAXCONNINFO];
+	ConnectionType connectionType;
+	char snapshot[BUFSIZE];
+} TransactionSnapshot;
+
+
+/*
+ * pgcopydb relies on pg_dump and pg_restore to implement the pre-data and the
+ * post-data section of the operation, and implements the data section
+ * differently. The data section itself is actually split in separate steps.
+ */
+typedef enum
+{
+	DATA_SECTION_NONE = 0,
+	DATA_SECTION_TABLE_DATA,
+	DATA_SECTION_SET_SEQUENCES,
+	DATA_SECTION_INDEXES,
+	DATA_SECTION_CONSTRAINTS,
+	DATA_SECTION_VACUUM,
+	DATA_SECTION_ALL
+} CopyDataSection;
+
 /* all that's needed to drive a single TABLE DATA copy process */
 typedef struct CopyTableDataSpec
 {
 	CopyFilePaths *cfPaths;
 	PostgresPaths *pgPaths;
 
-	char *source_pguri;
-	char *target_pguri;
+	char source_pguri[MAXCONNINFO];
+	char target_pguri[MAXCONNINFO];
+
+	TransactionSnapshot sourceSnapshot;
+
+	CopyDataSection section;
 
 	SourceTable *sourceTable;
 	SourceIndexArray *indexArray;
@@ -106,13 +140,18 @@ typedef struct CopyTableDataSpecsArray
 /* all that's needed to start a TABLE DATA copy for a whole database */
 typedef struct CopyDataSpec
 {
-	CopyFilePaths *cfPaths;
-	PostgresPaths *pgPaths;
+	CopyFilePaths cfPaths;
+	PostgresPaths pgPaths;
 
-	char *source_pguri;
-	char *target_pguri;
+	char source_pguri[MAXCONNINFO];
+	char target_pguri[MAXCONNINFO];
 
+	TransactionSnapshot sourceSnapshot;
+
+	CopyDataSection section;
 	bool dropIfExists;
+	bool noOwner;
+	bool skipLargeObjects;
 
 	int tableJobs;
 	int indexJobs;
@@ -134,16 +173,17 @@ typedef enum
 } PostgresDumpSection;
 
 
-bool copydb_init_workdir(CopyFilePaths *cfPaths, char *dir);
+bool copydb_init_workdir(CopyFilePaths *cfPaths, char *dir, bool removeDir);
 
 bool copydb_init_specs(CopyDataSpec *specs,
-					   CopyFilePaths *cfPaths,
-					   PostgresPaths *pgPaths,
 					   char *source_pguri,
 					   char *target_pguri,
 					   int tableJobs,
 					   int indexJobs,
-					   bool dropIfExists);
+					   CopyDataSection section,
+					   bool dropIfExists,
+					   bool noOwner,
+					   bool skipLargeObjects);
 
 bool copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 							 CopyDataSpec *specs,
@@ -158,6 +198,12 @@ bool copydb_target_finalize_schema(CopyDataSpec *specs);
 
 bool copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
 												uint32_t oid);
+
+bool copydb_export_snapshot(TransactionSnapshot *snapshot);
+bool copydb_set_snapshot(TransactionSnapshot *snapshot);
+bool copydb_close_snapshot(TransactionSnapshot *snapshot);
+
+bool copydb_copy_all_sequences(CopyDataSpec *specs);
 
 bool copydb_copy_all_table_data(CopyDataSpec *specs);
 bool copydb_start_table_data(CopyTableDataSpec *spec);

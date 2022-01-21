@@ -23,10 +23,15 @@ author = 'Dimitri Fontaine'
 
 # The full version, including alpha/beta/rc tags
 version = '0'
-release = '0.1'
+release = '0.2'
 
 
 # -- General configuration ---------------------------------------------------
+
+#
+# Avoid problems with older versions of shpinx as found on debian buster.
+#
+master_doc = 'index'
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
@@ -86,23 +91,30 @@ man_pages = [
         1,
     ),
     (
-        "ref/pgcopydb_dump_schema",
-        "pgcopydb dump schema",
-        "pgcopydb dump schema",
-        [author],
-        1,
-    ) ,
-    (
-        "ref/pgcopydb_dump_pre_data",
-        "pgcopydb dump pre-data",
-        "pgcopydb dump pre-data",
+        "ref/pgcopydb_dump",
+        "pgcopydb dump",
+        "pgcopydb dump",
         [author],
         1,
     ),
     (
-        "ref/pgcopydb_dump_post_data",
-        "pgcopydb dump post-data",
-        "pgcopydb dump post-data",
+        "ref/pgcopydb_restore",
+        "pgcopydb restore",
+        "pgcopydb restore",
+        [author],
+        1,
+    ),
+    (
+        "ref/pgcopydb_list",
+        "pgcopydb list",
+        "pgcopydb list",
+        [author],
+        1,
+    ),
+    (
+        "ref/pgcopydb_copy",
+        "pgcopydb copy",
+        "pgcopydb copy",
         [author],
         1,
     ),
