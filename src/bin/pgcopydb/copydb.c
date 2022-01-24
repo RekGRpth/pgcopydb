@@ -1021,60 +1021,37 @@ bool
 copydb_start_table_process(CopyDataSpec *specs)
 {
 	int errors = 0;
-	pid_t pid = getpid();
 
 	CopyTableDataSpecsArray *tableSpecsArray = &(specs->tableSpecsArray);
+
+	/* connect once to the source database for the whole process */
+	if (!copydb_set_snapshot(&(specs->sourceSnapshot)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	for (int tableIndex = 0; tableIndex < tableSpecsArray->count; tableIndex++)
 	{
 		/* initialize our TableDataProcess entry now */
 		CopyTableDataSpec *tableSpecs = &(tableSpecsArray->array[tableIndex]);
 
-		CopyTableSummary currentSummary = { .pid = pid, .table = NULL };
+		bool isBeingProcessed = false;
 
-		/* enter the critical section */
-		(void) semaphore_lock(&(specs->tableSemaphore));
-
-		/*
-		 * If the doneFile exists, then the table has been processed already,
-		 * skip it.
-		 *
-		 * If the lockFile exists, then the table is currently being processed
-		 * by another worker process, skip it.
-		 *
-		 * Otherwise, the table is not being processed yet, that must be our
-		 * job to take care of it.
-		 */
-		if (!(file_exists(tableSpecs->tablePaths.doneFile) ||
-			  file_exists(tableSpecs->tablePaths.lockFile)))
+		if (!copydb_table_is_being_processed(specs,
+											 tableSpecs,
+											 &isBeingProcessed))
 		{
-			/* First, write the lockFile, with a summary of what's going-on */
-			currentSummary.table = tableSpecs->sourceTable;
-
-			sformat(currentSummary.command, sizeof(currentSummary.command),
-					"COPY %s;",
-					tableSpecs->qname);
-
-			if (!open_table_summary(&currentSummary,
-									tableSpecs->tablePaths.lockFile))
-			{
-				log_info("Failed to create the lock file at \"%s\"",
-						 tableSpecs->tablePaths.lockFile);
-
-				/* end of the critical section */
-				(void) semaphore_unlock(&(specs->tableSemaphore));
-
-				return false;
-			}
-
-			tableSpecs->summary = &currentSummary;
+			/* errors have already been logged */
+			return false;
 		}
 
-		/* end of the critical section */
-		(void) semaphore_unlock(&(specs->tableSemaphore));
+		log_trace("%s isBeingProcessed: %s",
+				  tableSpecs->qname,
+				  isBeingProcessed ? "yes" : "no");
 
-		/* if we didn't select this table to process, move on to the next one */
-		if (tableSpecs->summary == NULL)
+		/* if the table is being processed, we should skip it now */
+		if (isBeingProcessed)
 		{
 			log_debug("Skipping table %s, already done or being processed",
 					  tableSpecs->qname);
@@ -1084,11 +1061,7 @@ copydb_start_table_process(CopyDataSpec *specs)
 		/*
 		 * 1. Now COPY the TABLE DATA from the source to the destination.
 		 */
-		if (!copydb_set_snapshot(&(tableSpecs->sourceSnapshot)))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		tableSpecs->sourceSnapshot = specs->sourceSnapshot;
 
 		if (!copydb_copy_table(tableSpecs))
 		{
@@ -1097,28 +1070,11 @@ copydb_start_table_process(CopyDataSpec *specs)
 		}
 
 		/* enter the critical section to communicate that we're done */
-		(void) semaphore_lock(&(specs->tableSemaphore));
-
-		if (!unlink_file(tableSpecs->tablePaths.lockFile))
+		if (!copydb_mark_table_as_done(specs, tableSpecs))
 		{
-			log_error("Failed to remove the lockFile \"%s\"",
-					  tableSpecs->tablePaths.lockFile);
-			(void) semaphore_unlock(&(specs->tableSemaphore));
+			/* errors have already been logged */
 			return false;
 		}
-
-		/* write the doneFile with the summary and timings now */
-		if (!finish_table_summary(&currentSummary,
-								  tableSpecs->tablePaths.doneFile))
-		{
-			log_info("Failed to create the summary file at \"%s\"",
-					 tableSpecs->tablePaths.doneFile);
-			(void) semaphore_unlock(&(specs->tableSemaphore));
-			return false;
-		}
-
-		/* end of the critical section */
-		(void) semaphore_unlock(&(specs->tableSemaphore));
 
 		/*
 		 * 2. Fetch the list of indexes and constraints attached to this table.
@@ -1147,9 +1103,6 @@ copydb_start_table_process(CopyDataSpec *specs)
 				++errors;
 			}
 		}
-
-		/* terminate our connection to the source database now */
-		(void) pgsql_finish(&(tableSpecs->sourceSnapshot.pgsql));
 
 		/*
 		 * 3. Now start the CREATE INDEX sub-processes for this table.
@@ -1192,6 +1145,9 @@ copydb_start_table_process(CopyDataSpec *specs)
 		}
 	}
 
+	/* terminate our connection to the source database now */
+	(void) pgsql_finish(&(specs->sourceSnapshot.pgsql));
+
 	/*
 	 * When this process has finished looping over all the tables in the table
 	 * array, then it waits until all the sub-processes are done. That's the
@@ -1204,6 +1160,114 @@ copydb_start_table_process(CopyDataSpec *specs)
 	}
 
 	return errors == 0;
+}
+
+
+/*
+ * copydb_table_is_being_processed checks lock and done files to see if a given
+ * table is already being processed, or has already been processed entirely by
+ * another process. In which case the table is to be skipped by the current
+ * process.
+ */
+bool
+copydb_table_is_being_processed(CopyDataSpec *specs,
+								CopyTableDataSpec *tableSpecs,
+								bool *isBeingProcessed)
+{
+	/* enter the critical section */
+	(void) semaphore_lock(&(specs->tableSemaphore));
+
+	/*
+	 * If the doneFile exists, then the table has been processed already,
+	 * skip it.
+	 *
+	 * If the lockFile exists, then the table is currently being processed
+	 * by another worker process, skip it.
+	 */
+	if (file_exists(tableSpecs->tablePaths.doneFile) ||
+		file_exists(tableSpecs->tablePaths.lockFile))
+	{
+		*isBeingProcessed = true;
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return true;
+	}
+
+	/*
+	 * Otherwise, the table is not being processed yet.
+	 */
+	*isBeingProcessed = false;
+
+	/*
+	 * First, write the lockFile, with a summary of what's going-on.
+	 */
+	CopyTableSummary emptySummary = { 0 };
+	CopyTableSummary *summary =
+		(CopyTableSummary *) malloc(sizeof(CopyTableSummary));
+
+	*summary = emptySummary;
+
+	summary->pid = getpid();
+	summary->table = tableSpecs->sourceTable;
+
+	sformat(summary->command, sizeof(summary->command),
+			"COPY %s;",
+			tableSpecs->qname);
+
+	if (!open_table_summary(summary, tableSpecs->tablePaths.lockFile))
+	{
+		log_info("Failed to create the lock file at \"%s\"",
+				 tableSpecs->tablePaths.lockFile);
+
+		/* end of the critical section */
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+
+		return false;
+	}
+
+	/* attach the new summary to the tableSpecs, where it was NULL before */
+	tableSpecs->summary = summary;
+
+	/* end of the critical section */
+	(void) semaphore_unlock(&(specs->tableSemaphore));
+
+	return true;
+}
+
+
+/*
+ * copydb_mark_table_as_done creates the table doneFile with the expected
+ * summary content. To create a doneFile we must acquire the synchronisation
+ * semaphore first. The lockFile is also removed here.
+ */
+bool
+copydb_mark_table_as_done(CopyDataSpec *specs,
+						  CopyTableDataSpec *tableSpecs)
+{
+	/* enter the critical section to communicate that we're done */
+	(void) semaphore_lock(&(specs->tableSemaphore));
+
+	if (!unlink_file(tableSpecs->tablePaths.lockFile))
+	{
+		log_error("Failed to remove the lockFile \"%s\"",
+				  tableSpecs->tablePaths.lockFile);
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return false;
+	}
+
+	/* write the doneFile with the summary and timings now */
+	if (!finish_table_summary(tableSpecs->summary,
+							  tableSpecs->tablePaths.doneFile))
+	{
+		log_info("Failed to create the summary file at \"%s\"",
+				 tableSpecs->tablePaths.doneFile);
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return false;
+	}
+
+	/* end of the critical section */
+	(void) semaphore_unlock(&(specs->tableSemaphore));
+
+	return true;
 }
 
 
@@ -1791,147 +1855,4 @@ copydb_collect_finished_subprocesses()
 	}
 
 	return allReturnCodeAreZero;
-}
-
-
-/*
- * print_summary prints a summary of the pgcopydb operations on stdout.
- *
- * The summary contains a line per table that has been copied and then the
- * count of indexes created for each table, and then the sum of the timing of
- * creating those indexes.
- *
- * TODO: also add-in the time it took to prepare and finalize the schema.
- */
-bool
-print_summary(Summary *summary, CopyDataSpec *specs)
-{
-	SummaryTable *summaryTable = &(summary->table);
-
-	/* first, we have to scan the available data from memory and files */
-	if (!prepare_summary_table(summary, specs))
-	{
-		log_error("Failed to prepare the summary table");
-		return false;
-	}
-
-	/* then we can prepare the headers and print the table */
-	if (specs->section == DATA_SECTION_TABLE_DATA ||
-		specs->section == DATA_SECTION_ALL)
-	{
-		(void) prepare_summary_table_headers(summaryTable);
-		(void) print_summary_table(summaryTable);
-	}
-
-	/* and then finally prepare the top-level counters and print them */
-	(void) summary_prepare_toplevel_durations(summary);
-	(void) print_toplevel_summary(summary, specs->tableJobs, specs->indexJobs);
-
-	return true;
-}
-
-
-/*
- * prepare_summary_table prepares the summar table array with the durations
- * read from disk in the doneFile for each oid that has been processed.
- */
-bool
-prepare_summary_table(Summary *summary, CopyDataSpec *specs)
-{
-	TopLevelTimings *timings = &(summary->timings);
-	SummaryTable *summaryTable = &(summary->table);
-	CopyTableDataSpecsArray *tableSpecsArray = &(specs->tableSpecsArray);
-
-	int count = tableSpecsArray->count;
-
-	summaryTable->count = count;
-	summaryTable->array =
-		(SummaryTableEntry *) malloc(count * sizeof(SummaryTableEntry));
-
-	if (summaryTable->array == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		return false;
-	}
-
-	for (int tableIndex = 0; tableIndex < tableSpecsArray->count; tableIndex++)
-	{
-		CopyTableDataSpec *tableSpecs = &(tableSpecsArray->array[tableIndex]);
-		SourceTable *table = tableSpecs->sourceTable;
-
-		SummaryTableEntry *entry = &(summaryTable->array[tableIndex]);
-
-		/* prepare some of the information we already have */
-		IntString oidString = intToString(table->oid);
-
-		strlcpy(entry->oid, oidString.strValue, sizeof(entry->oid));
-		strlcpy(entry->nspname, table->nspname, sizeof(entry->nspname));
-		strlcpy(entry->relname, table->relname, sizeof(entry->relname));
-
-		/* the specs doesn't contain timing information */
-		CopyTableSummary tableSummary = { .table = table };
-
-		if (!read_table_summary(&tableSummary, tableSpecs->tablePaths.doneFile))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		timings->tableDurationMs += tableSummary.durationMs;
-
-		(void) IntervalToString(tableSummary.durationMs,
-								entry->tableMs,
-								sizeof(entry->tableMs));
-
-		/* read the index oid list from the table oid */
-		uint64_t indexingDurationMs = 0;
-
-		SourceIndexArray indexArray = { 0 };
-
-		if (!read_table_index_file(&indexArray,
-								   tableSpecs->tablePaths.idxListFile))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		/* for reach index, read the index summary */
-		for (int i = 0; i < indexArray.count; i++)
-		{
-			SourceIndex *index = &(indexArray.array[i]);
-			CopyIndexSummary indexSummary = { .index = index };
-			char indexDoneFile[MAXPGPATH] = { 0 };
-
-			/* build the indexDoneFile for the target index */
-			sformat(indexDoneFile, sizeof(indexDoneFile), "%s/%u.done",
-					specs->cfPaths.idxdir,
-					index->indexOid);
-
-			/* when a table has no indexes, the file doesn't exists */
-			if (file_exists(indexDoneFile))
-			{
-				if (!read_index_summary(&indexSummary, indexDoneFile))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-
-				/* accumulate total duration of creating all the indexes */
-				timings->indexDurationMs += indexSummary.durationMs;
-				indexingDurationMs += indexSummary.durationMs;
-			}
-		}
-
-		IntString indexCountString = intToString(indexArray.count);
-
-		strlcpy(entry->indexCount,
-				indexCountString.strValue,
-				sizeof(entry->indexCount));
-
-		(void) IntervalToString(indexingDurationMs,
-								entry->indexMs,
-								sizeof(entry->indexMs));
-	}
-
-	return true;
 }
