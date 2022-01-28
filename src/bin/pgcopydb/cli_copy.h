@@ -13,6 +13,7 @@
 
 #include "cli_common.h"
 #include "cli_root.h"
+#include "pgcmd.h"
 #include "pgsql.h"
 
 typedef struct CopyDBOptions
@@ -21,9 +22,11 @@ typedef struct CopyDBOptions
 	char target_pguri[MAXCONNINFO];
 	int tableJobs;
 	int indexJobs;
-	bool dropIfExists;
-	bool noOwner;
+	RestoreOptions restoreOptions;
 	bool skipLargeObjects;
+	bool restart;
+	bool resume;
+	bool notConsistent;
 } CopyDBOptions;
 
 
