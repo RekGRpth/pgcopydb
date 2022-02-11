@@ -9,24 +9,24 @@
 #include <inttypes.h>
 
 #include "cli_common.h"
-#include "cli_dump.h"
 #include "cli_root.h"
 #include "copydb.h"
 #include "commandline.h"
 #include "env_utils.h"
 #include "log.h"
+#include "parsing.h"
 #include "pgcmd.h"
 #include "pgsql.h"
 #include "string_utils.h"
 
-DumpDBOptions dumpDBoptions = { 0 };
+CopyDBOptions dumpDBoptions = { 0 };
 
 static int cli_dump_schema_getopts(int argc, char **argv);
 static void cli_dump_schema(int argc, char **argv);
 static void cli_dump_schema_pre_data(int argc, char **argv);
 static void cli_dump_schema_post_data(int argc, char **argv);
 
-static void cli_dump_schema_section(DumpDBOptions *dumpDBoptions,
+static void cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 									PostgresDumpSection section);
 
 static CommandLine dump_schema_command =
@@ -81,7 +81,7 @@ CommandLine dump_commands =
 static int
 cli_dump_schema_getopts(int argc, char **argv)
 {
-	DumpDBOptions options = { 0 };
+	CopyDBOptions options = { 0 };
 	int c, option_index = 0;
 	int errors = 0, verboseCount = 0;
 
@@ -100,6 +100,13 @@ cli_dump_schema_getopts(int argc, char **argv)
 	};
 
 	optind = 0;
+
+	/* read values from the environment */
+	if (!cli_copydb_getenv(&options))
+	{
+		log_fatal("Failed to read default values from the environment");
+		exit(EXIT_CODE_BAD_ARGS);
+	}
 
 	while ((c = getopt_long(argc, argv, "S:T:Vvqh",
 							long_options, &option_index)) != -1)
@@ -121,8 +128,8 @@ cli_dump_schema_getopts(int argc, char **argv)
 
 			case 'T':
 			{
-				strlcpy(options.target_dir, optarg, MAXPGPATH);
-				log_trace("--target %s", options.target_dir);
+				strlcpy(options.dir, optarg, MAXPGPATH);
+				log_trace("--target %s", options.dir);
 				break;
 			}
 
@@ -202,31 +209,16 @@ cli_dump_schema_getopts(int argc, char **argv)
 		}
 	}
 
-	/* dump commands support the source URI environment variable */
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
-	{
-		if (env_exists(PGCOPYDB_SOURCE_PGURI))
-		{
-			if (!get_env_copy(PGCOPYDB_SOURCE_PGURI,
-							  options.source_pguri,
-							  sizeof(options.source_pguri)))
-			{
-				/* errors have already been logged */
-				++errors;
-			}
-		}
-	}
-
 	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
 	{
 		log_fatal("Option --source is mandatory");
 		++errors;
 	}
 
-	if (options.resume && !options.notConsistent)
+	if (!cli_copydb_is_consistent(&options))
 	{
 		log_fatal("Option --resume requires option --not-consistent");
-		++errors;
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	if (errors > 0)
@@ -276,7 +268,7 @@ cli_dump_schema_post_data(int argc, char **argv)
  * file.
  */
 static void
-cli_dump_schema_section(DumpDBOptions *dumpDBoptions,
+cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 						PostgresDumpSection section)
 {
 	CopyDataSpec copySpecs = { 0 };
@@ -287,9 +279,9 @@ cli_dump_schema_section(DumpDBOptions *dumpDBoptions,
 	(void) find_pg_commands(pgPaths);
 
 	char *dir =
-		IS_EMPTY_STRING_BUFFER(dumpDBoptions->target_dir)
+		IS_EMPTY_STRING_BUFFER(dumpDBoptions->dir)
 		? NULL
-		: dumpDBoptions->target_dir;
+		: dumpDBoptions->dir;
 
 	if (!copydb_init_workdir(&copySpecs,
 							 dir,
@@ -318,16 +310,42 @@ cli_dump_schema_section(DumpDBOptions *dumpDBoptions,
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	log_info("Dumping database from \"%s\"", copySpecs.source_pguri);
+	char scrubbedSourceURI[MAXCONNINFO] = { 0 };
+
+	(void) parse_and_scrub_connection_string(copySpecs.source_pguri,
+											 scrubbedSourceURI);
+
+	log_info("Dumping database from \"%s\"", scrubbedSourceURI);
 	log_info("Dumping database into directory \"%s\"", cfPaths->topdir);
 
 	log_info("Using pg_dump for Postgres \"%s\" at \"%s\"",
 			 pgPaths->pg_version,
 			 pgPaths->pg_dump);
 
-	if (!copydb_dump_source_schema(&copySpecs, NULL, section))
+	/*
+	 * First, we need to open a snapshot that we're going to re-use in all our
+	 * connections to the source database. When the --snapshot option has been
+	 * used, instead of exporting a new snapshot, we can just re-use it.
+	 */
+	if (!copydb_prepare_snapshot(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_dump_source_schema(&copySpecs,
+								   copySpecs.sourceSnapshot.snapshot,
+								   section))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_close_snapshot(&(copySpecs.sourceSnapshot)))
+	{
+		log_fatal("Failed to close snapshot \"%s\" on \"%s\"",
+				  copySpecs.sourceSnapshot.snapshot,
+				  copySpecs.sourceSnapshot.pguri);
+		exit(EXIT_CODE_SOURCE);
 	}
 }

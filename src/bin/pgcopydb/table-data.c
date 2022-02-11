@@ -10,7 +10,6 @@
 #include <unistd.h>
 
 #include "cli_common.h"
-#include "cli_copy.h"
 #include "cli_root.h"
 #include "copydb.h"
 #include "env_utils.h"
@@ -39,7 +38,8 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 
 	if (specs->dirState.tableCopyIsDone &&
 		specs->dirState.indexCopyIsDone &&
-		specs->dirState.sequenceCopyIsDone)
+		specs->dirState.sequenceCopyIsDone &&
+		specs->section != DATA_SECTION_CONSTRAINTS)
 	{
 		log_info("Skipping tables, indexes, and sequences, "
 				 "already done on a previous run");
@@ -65,6 +65,25 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 		(void) copydb_fatal_exit();
 	}
 
+	if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+	{
+		int signal = get_current_signal(SIGTERM);
+		const char *signalStr = signal_to_string(signal);
+
+		log_warn("Received signal %s, terminating", signalStr);
+
+		/* ensure we return false, signaling something unexpected happened */
+		++errors;
+		goto terminate;
+	}
+
+	/* Now write that we successfully finished copying all indexes */
+	if (!write_file("", 0, specs->cfPaths.done.indexes))
+	{
+		log_warn("Failed to write the tracking file \%s\"",
+				 specs->cfPaths.done.indexes);
+	}
+
 	/*
 	 * Now is a good time to reset sequences: we're waiting for the TABLE DATA
 	 * sections and the CREATE INDEX, CONSTRAINTS and VACUUM ANALYZE to be done
@@ -77,6 +96,8 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 		/* errors have already been logged */
 		++errors;
 	}
+
+terminate:
 
 	/* now we have a unknown count of subprocesses still running */
 	if (!copydb_wait_for_subprocesses())
@@ -101,13 +122,6 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 		log_warn("Failed to remove index concurrency semaphore %d, "
 				 "see above for details",
 				 specs->indexSemaphore.semId);
-	}
-
-	/* and write that we successfully finished copying all indexes */
-	if (!write_file("", 0, specs->cfPaths.done.indexes))
-	{
-		log_warn("Failed to write the tracking file \%s\"",
-				 specs->cfPaths.done.indexes);
 	}
 
 	return errors == 0;
@@ -301,6 +315,15 @@ copydb_start_table_process(CopyDataSpec *specs)
 		/* reuse the same connection to the source database */
 		tableSpecs->sourceSnapshot = specs->sourceSnapshot;
 
+		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		{
+			int signal = get_current_signal(SIGTERM);
+			const char *signalStr = signal_to_string(signal);
+
+			log_debug("Received signal %s, terminating", signalStr);
+			break;
+		}
+
 		bool isDone = false;
 		bool isBeingProcessed = false;
 
@@ -336,11 +359,12 @@ copydb_start_table_process(CopyDataSpec *specs)
 		 * 2. Fetch the list of indexes and constraints attached to this table
 		 *    and create them in a background process.
 		 */
-		if (specs->dirState.indexCopyIsDone)
+		if (specs->dirState.indexCopyIsDone &&
+			specs->section != DATA_SECTION_CONSTRAINTS)
 		{
 			log_info("Skipping indexes, already done on a previous run");
 		}
-		else if ((!isDone && !isBeingProcessed))
+		else if (!isDone && !isBeingProcessed)
 		{
 			if (!copydb_copy_table_indexes(tableSpecs))
 			{
@@ -798,6 +822,7 @@ copydb_start_create_table_indexes(CopyTableDataSpec *tableSpecs)
 										 indexPaths,
 										 lockFileSemaphore,
 										 tableSpecs->indexSemaphore,
+										 false, /* constraint */
 										 ifNotExists))
 				{
 					/* errors have already been logged */
@@ -900,21 +925,16 @@ copydb_create_constraints(CopyTableDataSpec *tableSpecs)
 
 		char sql[BUFSIZE] = { 0 };
 
-		sformat(sql, sizeof(sql),
-				"ALTER TABLE \"%s\".\"%s\" "
-				"ADD CONSTRAINT \"%s\" %s "
-				"USING INDEX \"%s\"",
-				index->tableNamespace,
-				index->tableRelname,
-				index->constraintName,
-				index->isPrimary
-				? "PRIMARY KEY"
-				: (index->isUnique ? "UNIQUE" : ""),
-				index->indexRelname);
+		if (!copydb_prepare_create_constraint_command(index, sql, sizeof(sql)))
+		{
+			log_warn("Failed to prepare SQL command to create constraint \"%s\"",
+					 index->constraintName);
+			continue;
+		}
 
 		if (!foundConstraintOnTarget)
 		{
-			log_info("%s;", sql);
+			log_info("%s", sql);
 
 			if (!pgsql_execute(&dst, sql))
 			{
@@ -931,7 +951,7 @@ copydb_create_constraints(CopyTableDataSpec *tableSpecs)
 		 */
 		char contents[BUFSIZE] = { 0 };
 
-		sformat(contents, sizeof(contents), "%s;\n", sql);
+		sformat(contents, sizeof(contents), "%s\n", sql);
 
 		if (!write_file(contents,
 						strlen(contents),
