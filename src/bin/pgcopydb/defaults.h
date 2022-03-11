@@ -7,7 +7,7 @@
 #define DEFAULTS_H
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.4"
+#define PGCOPYDB_VERSION "0.5"
 
 /* environment variable to use to make DEBUG facilities available */
 #define PGCOPYDB_DEBUG "PGCOPYDB_DEBUG"
@@ -23,7 +23,7 @@
 #define PGCOPYDB_DROP_IF_EXISTS "PGCOPYDB_DROP_IF_EXISTS"
 #define PGCOPYDB_SNAPSHOT "PGCOPYDB_SNAPSHOT"
 
-#define POSTGRES_CONNECT_TIMEOUT "2"
+#define POSTGRES_CONNECT_TIMEOUT "10"
 
 
 /* retry PQping for a maximum of 15 mins, up to 2 secs between attemps */
