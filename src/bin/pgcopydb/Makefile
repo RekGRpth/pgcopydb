@@ -5,6 +5,8 @@ PGCOPYDB = ./pgcopydb
 
 SRC_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
+-include $(SRC_DIR)../../../GIT-VERSION-FILE
+
 DEPDIR = $(SRC_DIR)/.deps
 
 INCLUDES  = $(patsubst ${SRC_DIR}%.h,%.h,$(wildcard ${SRC_DIR}*.h))
@@ -26,6 +28,7 @@ COMMON_LIBS += -I${SRC_DIR}../lib/log/src/
 COMMON_LIBS += -I${SRC_DIR}../lib/subcommands.c/
 COMMON_LIBS += -I${SRC_DIR}../lib/libs/
 COMMON_LIBS += -I${SRC_DIR}../lib/parson/
+COMMON_LIBS += -I${SRC_DIR}../lib/uthash
 
 CC = $(shell $(PG_CONFIG) --cc)
 
@@ -77,7 +80,7 @@ include $(Po_files)
 endif
 
 
-$(PGCOPYDB): $(OBJS) $(INCLUDES)
+$(PGCOPYDB): VERSION-FILE $(OBJS) $(INCLUDES)
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) $(LIBS) -o $@
 
 lib-snprintf.o: $(PG_SNPRINTF)
@@ -95,7 +98,13 @@ lib-commandline.o: $(COMMANDLINE_SRC)
 lib-parson.o: $(PARSON_SRC)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/parson/parson.c
 
+VERSION-FILE: git-version.h ;
+
+git-version.h:
+	echo "#define GIT_VERSION \""$(GIT_VERSION)"\"" > $@
+
 clean:
+	rm -f git-version.h
 	rm -f $(OBJS) $(PGCOPYDB)
 	rm -rf $(DEPDIR)
 
@@ -106,3 +115,4 @@ install: $(PGCOPYDB)
 
 
 .PHONY: all monitor clean
+.PHONY: VERSION-FILE
