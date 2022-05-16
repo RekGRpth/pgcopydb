@@ -9,7 +9,7 @@
 #include "git-version.h"
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.5"
+#define PGCOPYDB_VERSION "0.6"
 
 #ifdef GIT_VERSION
 #define VERSION_STRING GIT_VERSION
@@ -30,6 +30,7 @@
 #define PGCOPYDB_TARGET_INDEX_JOBS "PGCOPYDB_TARGET_INDEX_JOBS"
 #define PGCOPYDB_DROP_IF_EXISTS "PGCOPYDB_DROP_IF_EXISTS"
 #define PGCOPYDB_SNAPSHOT "PGCOPYDB_SNAPSHOT"
+#define PGCOPYDB_PGAPPNAME "pgcopydb"
 
 #define POSTGRES_CONNECT_TIMEOUT "10"
 
