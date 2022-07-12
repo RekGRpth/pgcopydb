@@ -46,6 +46,7 @@ stream_init_specs(StreamSpecs *specs,
 				  char *source_pguri,
 				  char *target_pguri,
 				  char *slotName,
+				  char *origin,
 				  uint64_t endpos,
 				  LogicalStreamMode mode)
 {
@@ -57,6 +58,7 @@ stream_init_specs(StreamSpecs *specs,
 	strlcpy(specs->source_pguri, source_pguri, MAXCONNINFO);
 	strlcpy(specs->target_pguri, target_pguri, MAXCONNINFO);
 	strlcpy(specs->slotName, slotName, sizeof(specs->slotName));
+	strlcpy(specs->origin, origin, sizeof(specs->origin));
 
 	if (!buildReplicationURI(specs->source_pguri, specs->logrep_pguri))
 	{
@@ -1009,7 +1011,7 @@ stream_create_repl_slot(CopyDataSpec *copySpecs, char *slotName, uint64_t *lsn)
 
 	bool slotExists = false;
 
-	if (!pgsql_replication_slot_exists(pgsql, slotName, &slotExists))
+	if (!pgsql_replication_slot_exists(pgsql, slotName, &slotExists, lsn))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1017,32 +1019,44 @@ stream_create_repl_slot(CopyDataSpec *copySpecs, char *slotName, uint64_t *lsn)
 
 	if (slotExists)
 	{
-		log_error("Failed to create replication slot \"%s\": already exists",
-				  slotName);
-		pgsql_rollback(pgsql);
-		return false;
-	}
+		if (!copySpecs->resume)
+		{
+			log_error("Failed to create replication slot \"%s\": already exists",
+					  slotName);
+			pgsql_rollback(pgsql);
+			return false;
+		}
 
-	if (!pgsql_create_replication_slot(pgsql,
-									   slotName,
-									   REPLICATION_PLUGIN,
-									   lsn))
+		log_info("Logical replication slot \"%s\" already exists at LSN %X/%X",
+				 slotName,
+				 LSN_FORMAT_ARGS(*lsn));
+
+		pgsql_commit(pgsql);
+		return true;
+	}
+	else
 	{
-		/* errors have already been logged */
-		return false;
-	}
+		if (!pgsql_create_replication_slot(pgsql,
+										   slotName,
+										   REPLICATION_PLUGIN,
+										   lsn))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 
-	if (!pgsql_commit(pgsql))
-	{
-		/* errors have already been logged */
-		return false;
-	}
+		if (!pgsql_commit(pgsql))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 
-	log_info("Created logical replication slot \"%s\" with plugin \"%s\" "
-			 "at LSN %X/%X",
-			 slotName,
-			 REPLICATION_PLUGIN,
-			 LSN_FORMAT_ARGS(*lsn));
+		log_info("Created logical replication slot \"%s\" with plugin \"%s\" "
+				 "at LSN %X/%X",
+				 slotName,
+				 REPLICATION_PLUGIN,
+				 LSN_FORMAT_ARGS(*lsn));
+	}
 
 	return true;
 }
@@ -1111,13 +1125,20 @@ stream_create_origin(CopyDataSpec *copySpecs, char *nodeName, uint64_t startpos)
 			return false;
 		}
 
-		log_level(lsn == startpos ? LOG_INFO : LOG_ERROR,
+		/*
+		 * We accept the current target origin position when --resume has been
+		 * used, and also when a --startpos has been given that matches exactly
+		 * the current tracked position.
+		 */
+		bool acceptTrackedLSN = copySpecs->resume || lsn == startpos;
+
+		log_level(acceptTrackedLSN ? LOG_INFO : LOG_ERROR,
 				  "Replication origin \"%s\" already exists and "
 				  "progressed to LSN %X/%X",
 				  nodeName,
 				  LSN_FORMAT_ARGS(lsn));
 
-		if (lsn != startpos)
+		if (!acceptTrackedLSN)
 		{
 			/* errors have already been logged */
 			pgsql_finish(&dst);
