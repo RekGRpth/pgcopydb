@@ -101,7 +101,7 @@ The process tree then looks like the following:
 
 When starting with the TABLE DATA copying step, then pgcopydb creates as
 many sub-processes as specified by the ``--table-jobs`` command line option
-(or the environment variable ``PGCOPYDB_TARGET_TABLE_JOBS``).
+(or the environment variable ``PGCOPYDB_TABLE_JOBS``).
 
 Then as soon as the COPY command is done, another sub-process can be
 created. At this time in the process, pgcopydb might be running more
@@ -149,3 +149,10 @@ the other index builds.
 The ``--index-jobs`` option has been made global so that it's easier to
 setup to the count of available CPU cores on the target Postgres instance.
 Usually, a given CREATE INDEX command uses 100% of a single core.
+
+Same-table concurrency
+----------------------
+
+See also option ``--split-tables-larger-than`` for the :ref:`pgcopydb_clone`
+command, and the coverage of the :ref:`same_table_concurrency` concept in
+pgcopydb.
