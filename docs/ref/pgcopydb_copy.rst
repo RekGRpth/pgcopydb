@@ -93,6 +93,11 @@ When a role already exists on the target database, its restoring is entirely
 skipped, which includes skipping both the ``CREATE ROLE`` and the ``ALTER
 ROLE`` commands produced by ``pg_dumpall --roles-only``.
 
+The ``pg_dumpall --roles-only`` is used to fetch the list of roles from the
+source database, and this command includes support for passwords. As a
+result, this operation requires the superuser privileges.
+
+
 .. _pgcopydb_copy_schema:
 
 pgcopydb copy schema
@@ -241,7 +246,7 @@ database.
 
      --source          Postgres URI to the source database
      --target          Postgres URI to the target database
-     --dir                 Work directory to use
+     --dir             Work directory to use
      --restart         Allow restarting when temp files exist already
      --resume          Allow resuming operations after a failure
      --not-consistent  Allow taking a new snapshot on the source database
@@ -266,7 +271,7 @@ target database.
 
      --source          Postgres URI to the source database
      --target          Postgres URI to the target database
-     --dir                 Work directory to use
+     --dir             Work directory to use
 	 --index-jobs      Number of concurrent CREATE INDEX jobs to run
      --restart         Allow restarting when temp files exist already
      --resume          Allow resuming operations after a failure
@@ -293,7 +298,7 @@ is found existing already on the target database.
 
      --source          Postgres URI to the source database
      --target          Postgres URI to the target database
-     --dir                 Work directory to use
+     --dir             Work directory to use
      --restart         Allow restarting when temp files exist already
      --resume          Allow resuming operations after a failure
      --not-consistent  Allow taking a new snapshot on the source data
