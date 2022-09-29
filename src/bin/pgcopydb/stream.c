@@ -130,6 +130,18 @@ startLogicalStreaming(StreamSpecs *specs)
 
 	context.private = (void *) &(privateContext);
 
+	if (!queue_create(&(privateContext.transformQueue)))
+	{
+		log_error("Failed to create the Stream Transform process queue");
+		return false;
+	}
+
+	if (!stream_transform_start_worker(&context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	/*
 	 * In case of being disconnected or other transient errors, reconnect and
 	 * continue streaming.
@@ -346,6 +358,9 @@ streamWrite(LogicalStreamContext *context)
 				log_error("Failed to close file \"%s\": %m",
 						  privateContext->walFileName);
 			}
+
+			/* reset the jsonFile FILE * pointer to NULL, it's closed now */
+			privateContext->jsonFile = NULL;
 		}
 
 		json_value_free(json);
@@ -399,6 +414,9 @@ streamWrite(LogicalStreamContext *context)
 					log_error("Failed to close file \"%s\": %m",
 							  privateContext->walFileName);
 				}
+
+				/* reset the jsonFile FILE * pointer to NULL, it's closed now */
+				privateContext->jsonFile = NULL;
 			}
 			return false;
 		}
@@ -488,6 +506,9 @@ streamRotateFile(LogicalStreamContext *context)
 			privateContext->paths.dir,
 			wal);
 
+	/* the context->cur_record_lsn is the firstLSN for this file */
+	privateContext->firstLSN = context->cur_record_lsn;
+
 	/*
 	 * When the target file already exists, open it in append mode.
 	 */
@@ -541,18 +562,26 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 {
 	StreamContext *privateContext = (StreamContext *) context->private;
 
-	if (privateContext->jsonFile == NULL)
+	/*
+	 * If we have a JSON file currently opened, then close it.
+	 *
+	 * Some situations exist where there is no JSON file currently opened and
+	 * we still want to transform the latest JSON file into SQL: we might reach
+	 * endpos at startup, for instance.
+	 */
+	if (privateContext->jsonFile != NULL)
 	{
-		return true;
-	}
+		log_debug("Closing file \"%s\"", privateContext->walFileName);
 
-	log_debug("Closing file \"%s\"", privateContext->walFileName);
+		if (fclose(privateContext->jsonFile) != 0)
+		{
+			log_error("Failed to close file \"%s\": %m",
+					  privateContext->walFileName);
+			return false;
+		}
 
-	if (fclose(privateContext->jsonFile) != 0)
-	{
-		log_error("Failed to close file \"%s\": %m",
-				  privateContext->walFileName);
-		return false;
+		/* reset the jsonFile FILE * pointer to NULL, it's closed now */
+		privateContext->jsonFile = NULL;
 	}
 
 	/* in prefetch mode, kick-in a transform process */
@@ -572,10 +601,16 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 			 * The transformation of the file uses enough CPU that we'd prefer
 			 * to start it in a subprocess.
 			 */
-			if (!streamTransformFileInSubprocess(context))
+			Queue *transformQueue = &(privateContext->transformQueue);
+
+			if (privateContext->firstLSN != InvalidXLogRecPtr)
 			{
-				/* errors have already been logged */
-				return false;
+				if (!stream_transform_add_file(transformQueue,
+											   privateContext->firstLSN))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 			}
 
 			/*
@@ -588,6 +623,12 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 			 */
 			if (time_to_abort)
 			{
+				if (!stream_transform_send_stop(transformQueue))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
 				if (!streamWaitForSubprocess(context))
 				{
 					/* errors have already been logged */
@@ -1092,69 +1133,6 @@ StreamActionFromChar(char action)
 
 
 /*
- * streamTransformFileInSubprocess creates an auxiliary process to run the
- * stream_transform_file() function on the just closed JSON file.
- */
-bool
-streamTransformFileInSubprocess(LogicalStreamContext *context)
-{
-	StreamContext *privateContext = (StreamContext *) context->private;
-
-	/*
-	 * First, wait any already started subprocess.
-	 *
-	 * The assumption here is that by the time we have received another WAL
-	 * size content of JSON messages, the transform subprocess should be
-	 * finished already.
-	 */
-	if (!streamWaitForSubprocess(context))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* now we can fork a sub-process to transform the current file */
-	pid_t fpid = fork();
-
-	switch (fpid)
-	{
-		case -1:
-		{
-			log_error("Failed to fork a subprocess to transform "
-					  "JSON file \"%s\" into SQL: %m",
-					  privateContext->walFileName);
-			return -1;
-		}
-
-		case 0:
-		{
-			/* child process runs the command */
-			if (!stream_transform_file(privateContext->walFileName,
-									   privateContext->sqlFileName))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			/* and we're done */
-			exit(EXIT_CODE_QUIT);
-		}
-
-		default:
-		{
-			privateContext->subprocess = fpid;
-			log_info("Starting subprocess %d to prepare \"%s\"",
-					 fpid,
-					 privateContext->sqlFileName);
-			break;
-		}
-	}
-
-	return true;
-}
-
-
-/*
  * streamWaitForSubprocess calls waitpid() and blocks until the current
  * subprocess is reported terminated by the Operating System.
  */
@@ -1175,16 +1153,20 @@ streamWaitForSubprocess(LogicalStreamContext *context)
 			return false;
 		}
 
-		if (WEXITSTATUS(status) != 0)
+		int returnCode = WEXITSTATUS(status);
+
+		if (returnCode != 0)
 		{
-			log_error("Failed to transform previous JSON file into SQL, "
-					  "see above for details");
+			log_error("Stream Transform Worker %d exited with code %d, "
+					  "see above for details",
+					  privateContext->subprocess,
+					  returnCode);
 			return false;
 		}
 
 		log_debug("Transform subprocess %d exited successfully [%d]",
 				  privateContext->subprocess,
-				  status);
+				  returnCode);
 
 		privateContext->subprocess = 0;
 	}
@@ -1634,7 +1616,7 @@ stream_cleanup_context(StreamSpecs *specs)
  * wal_segment_size and timeline history.
  */
 bool
-stream_read_context(StreamSpecs *specs,
+stream_read_context(CDCPaths *paths,
 					IdentifySystem *system,
 					uint32_t *WalSegSz)
 {
@@ -1657,9 +1639,9 @@ stream_read_context(StreamSpecs *specs,
 
 	while (!pgsql_retry_policy_expired(&retryPolicy))
 	{
-		if (file_exists(specs->paths.walsegsizefile) &&
-			file_exists(specs->paths.tlifile) &&
-			file_exists(specs->paths.tlihistfile))
+		if (file_exists(paths->walsegsizefile) &&
+			file_exists(paths->tlifile) &&
+			file_exists(paths->tlihistfile))
 		{
 			/* success: break out of the retry loop */
 			break;
@@ -1677,7 +1659,7 @@ stream_read_context(StreamSpecs *specs,
 	}
 
 	/* we don't want to retry anymore, error out if files still don't exist */
-	if (!read_file(specs->paths.walsegsizefile, &wal_segment_size, &size))
+	if (!read_file(paths->walsegsizefile, &wal_segment_size, &size))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1691,7 +1673,7 @@ stream_read_context(StreamSpecs *specs,
 
 	char *tli;
 
-	if (!read_file(specs->paths.tlifile, &tli, &size))
+	if (!read_file(paths->tlifile, &tli, &size))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1705,13 +1687,13 @@ stream_read_context(StreamSpecs *specs,
 
 	char *history = NULL;
 
-	if (!read_file(specs->paths.tlihistfile, &history, &size))
+	if (!read_file(paths->tlihistfile, &history, &size))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!parseTimeLineHistory(specs->paths.tlihistfile, history, system))
+	if (!parseTimeLineHistory(paths->tlihistfile, history, system))
 	{
 		/* errors have already been logged */
 		return false;
