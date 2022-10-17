@@ -145,6 +145,19 @@ typedef enum
 	ISOLATION_READ_UNCOMMITTED,
 } IsolationLevel;
 
+/*
+ * As a way to communicate the SQL STATE when an error occurs, every
+ * pgsql_execute_with_params context structure must have the same first field,
+ * an array of 5 characters (plus '\0' at the end).
+ */
+#define SQLSTATE_LENGTH 6
+
+/*
+ * That's "x.yy.zz" or "xx.zz" or maybe a debian style version string such as:
+ *  "13.8 (Debian 13.8-1.pgdg110+1)"
+ */
+#define PG_VERSION_STRING_MAX_LENGTH 45
+
 /* notification processing */
 typedef bool (*ProcessNotificationFunction)(int notificationGroupId,
 											int64_t notificationNodeId,
@@ -158,8 +171,9 @@ typedef struct PGSQL
 	PGconn *connection;
 	ConnectionRetryPolicy retryPolicy;
 	PGConnStatus status;
+	char sqlstate[SQLSTATE_LENGTH];
 
-	char pgversion[12];         /* "x.yy.zz" or "xx.zz" */
+	char pgversion[PG_VERSION_STRING_MAX_LENGTH];
 	int pgversion_num;
 
 	ProcessNotificationFunction notificationProcessFunction;
@@ -185,13 +199,6 @@ typedef enum
 	PGSQL_RESULT_BIGINT,
 	PGSQL_RESULT_STRING
 } QueryResultType;
-
-/*
- * As a way to communicate the SQL STATE when an error occurs, every
- * pgsql_execute_with_params context structure must have the same first field,
- * an array of 5 characters (plus '\0' at the end).
- */
-#define SQLSTATE_LENGTH 6
 
 #define STR_ERRCODE_CLASS_CONNECTION_EXCEPTION "08"
 
@@ -234,6 +241,8 @@ void pgsql_set_main_loop_retry_policy(ConnectionRetryPolicy *retryPolicy);
 void pgsql_set_interactive_retry_policy(ConnectionRetryPolicy *retryPolicy);
 int pgsql_compute_connection_retry_sleep_time(ConnectionRetryPolicy *retryPolicy);
 bool pgsql_retry_policy_expired(ConnectionRetryPolicy *retryPolicy);
+
+bool pgsql_state_is_connection_error(PGSQL *pgsql);
 
 void pgsql_finish(PGSQL *pgsql);
 void parseSingleValueResult(void *ctx, PGresult *result);
