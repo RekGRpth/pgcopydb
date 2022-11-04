@@ -17,7 +17,8 @@ RUN apt-get update \
         liblz4-dev \
     	libpq5 \
         libpq-dev \
-        postgresql-server-dev-all \
+        libzstd-dev \
+		postgresql-server-dev-all \
         postgresql-common \
         postgresql \
         python3-sphinx \
@@ -35,7 +36,7 @@ COPY ./src ./src/
 COPY ./docs ./docs/
 
 WORKDIR /usr/src
-RUN tar czf pgcopydb_0.9.orig.tar.gz pgcopydb
+RUN tar czf pgcopydb_0.10.orig.tar.gz pgcopydb
 
 WORKDIR /usr/src/pgcopydb
 
