@@ -22,8 +22,8 @@ copyright = '2022, Dimitri Fontaine'
 author = 'Dimitri Fontaine'
 
 # The full version, including alpha/beta/rc tags
-version = '0.10'
-release = '0.10'
+version = '0.11'
+release = '0.11'
 
 
 # -- General configuration ---------------------------------------------------
@@ -60,6 +60,7 @@ html_theme = "sphinx_rtd_theme"
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 
+latex_engine = 'xelatex'
 
 #
 # https://stackoverflow.com/questions/9899283/how-do-you-change-the-code-example-font-size-in-latex-pdf-output-with-sphinx
