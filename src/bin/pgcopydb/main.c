@@ -13,6 +13,7 @@
 #endif
 
 #include "cli_root.h"
+#include "copydb.h"
 #include "defaults.h"
 #include "env_utils.h"
 #include "file_utils.h"
@@ -32,9 +33,10 @@ size_t last_status_len;         /* use to minimize length of clobber */
 
 Semaphore log_semaphore = { 0 }; /* allows inter-process locking */
 
+SysVResArray system_res_array = { 0 };
 
 static void set_logger(void);
-static void log_semaphore_unlink_atexit(void);
+static void unlink_system_res_atexit(void);
 
 
 /*
@@ -70,8 +72,8 @@ main(int argc, char **argv)
 	pg_logging_init(argv[0]);
 	#endif
 
-	/* register our logging clean-up atexit */
-	atexit(log_semaphore_unlink_atexit);
+	/* register our System V resources clean-up atexit */
+	atexit(unlink_system_res_atexit);
 
 	/*
 	 * When PGCOPYDB_DEBUG is set in the environment, provide the user
@@ -183,7 +185,26 @@ set_logger()
 	 * Log messages go to stderr. We use colours when stderr is being shown
 	 * directly to the user to make it easier to spot warnings and errors.
 	 */
-	log_use_colors(isatty(fileno(stderr)));
+	bool interactive = isatty(fileno(stderr));
+
+	log_use_colors(interactive);
+	log_show_file_line(!interactive);
+
+	char *log_time_format_default =
+		interactive ? LOG_TFORMAT_SHORT : LOG_TFORMAT_LONG;
+
+	char log_time_format[128] = { 0 };
+
+	if (!get_env_copy_with_fallback(PGCOPYDB_LOG_TIME_FORMAT,
+									log_time_format,
+									sizeof(log_time_format),
+									log_time_format_default))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	log_set_tformat(log_time_format);
 
 	/* initialize the semaphore used for locking log output */
 	if (!semaphore_init(&log_semaphore))
@@ -198,10 +219,12 @@ set_logger()
 
 
 /*
- * log_semaphore_unlink_atexit calls semaphore_unlink() atexit.
+ * unlink_system_res_atexit cleans-up System V resources that have been
+ * registered in the global array during run-time. It is registered as an
+ * atexit(3) facility.
  */
 static void
-log_semaphore_unlink_atexit(void)
+unlink_system_res_atexit(void)
 {
-	(void) semaphore_finish(&log_semaphore);
+	(void) copydb_cleanup_sysv_resources(&system_res_array);
 }
