@@ -23,6 +23,12 @@
 bool
 vacuum_start_workers(CopyDataSpec *specs)
 {
+	if (specs->skipVacuum)
+	{
+		log_info("STEP 8: skipping VACUUM jobs per --skip-vacuum");
+		return true;
+	}
+
 	log_info("STEP 8: starting %d VACUUM processes", specs->vacuumJobs);
 	log_trace("vacuum_start_workers: \"%s\"", specs->cfPaths.tbldir);
 
@@ -230,11 +236,11 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
  * given table.
  */
 bool
-vacuum_add_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
+vacuum_add_table(CopyDataSpec *specs, uint32_t oid)
 {
 	QMessage mesg = {
 		.type = QMSG_TYPE_TABLEOID,
-		.data.oid = tableSpecs->sourceTable->oid
+		.data.oid = oid
 	};
 
 	if (!queue_send(&(specs->vacuumQueue), &mesg))
@@ -256,6 +262,11 @@ vacuum_add_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 bool
 vacuum_send_stop(CopyDataSpec *specs)
 {
+	if (specs->skipVacuum)
+	{
+		return true;
+	}
+
 	for (int i = 0; i < specs->vacuumJobs; i++)
 	{
 		QMessage stop = { .type = QMSG_TYPE_STOP, .data.oid = 0 };
