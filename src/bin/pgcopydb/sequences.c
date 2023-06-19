@@ -62,13 +62,8 @@ copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql)
 		 * SELECT privilege.
 		 */
 		bool granted = false;
-		char lname[BUFSIZE] = { 0 };
 
-		sformat(lname, sizeof(lname), "%s.%s",
-				seq->nspname,
-				seq->relname);
-
-		if (!pgsql_has_sequence_privilege(pgsql, lname, "select", &granted))
+		if (!pgsql_has_sequence_privilege(pgsql, qname, "select", &granted))
 		{
 			/* errors have been logged */
 			++errors;
@@ -174,7 +169,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs)
 
 	PGSQL dst = { 0 };
 
-	if (!pgsql_init(&dst, specs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
 		return false;
