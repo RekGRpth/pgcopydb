@@ -456,6 +456,8 @@ bool parseMessageMetadata(LogicalMessageMetadata *metadata,
 						  JSON_Value *json,
 						  bool skipAction);
 
+bool LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b);
+
 bool stream_write_json(LogicalStreamContext *context, bool previous);
 
 bool stream_write_internal_message(LogicalStreamContext *context,
@@ -549,6 +551,8 @@ bool writeTxnMetadataFile(LogicalTransaction *txn, const char *dir);
 void FreeLogicalMessage(LogicalMessage *msg);
 void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
+void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
+bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
 
 /* ld_test_decoding.c */
 bool prepareTestDecodingMessage(LogicalStreamContext *context);

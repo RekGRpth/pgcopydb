@@ -1223,27 +1223,92 @@ FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray)
 {
 	for (int s = 0; s < tupleArray->count; s++)
 	{
-		LogicalMessageTuple *stmt = &(tupleArray->array[s]);
+		LogicalMessageTuple *tuple = &(tupleArray->array[s]);
 
-		free(stmt->columns);
-
-		for (int r = 0; r < stmt->values.count; r++)
-		{
-			LogicalMessageValues *values = &(stmt->values.array[r]);
-
-			for (int v = 0; v < values->cols; v++)
-			{
-				LogicalMessageValue *value = &(values->array[v]);
-
-				if (value->oid == TEXTOID || value->oid == BYTEAOID)
-				{
-					free(value->val.str);
-				}
-			}
-
-			free(stmt->values.array);
-		}
+		(void) FreeLogicalMessageTuple(tuple);
 	}
+}
+
+
+/*
+ * FreeLogicalMessageTuple frees the malloc'ated memory areas of a
+ * LogicalMessageTuple.
+ */
+void
+FreeLogicalMessageTuple(LogicalMessageTuple *tuple)
+{
+	free(tuple->columns);
+
+	for (int r = 0; r < tuple->values.count; r++)
+	{
+		LogicalMessageValues *values = &(tuple->values.array[r]);
+
+		for (int v = 0; v < values->cols; v++)
+		{
+			LogicalMessageValue *value = &(values->array[v]);
+
+			if ((value->oid == TEXTOID || value->oid == BYTEAOID) &&
+				!value->isNull)
+			{
+				free(value->val.str);
+			}
+		}
+
+		free(tuple->values.array);
+	}
+}
+
+
+/*
+ * allocateLogicalMessageTuple allocates memory for count columns (and values)
+ * for the given LogicalMessageTuple.
+ */
+bool
+AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
+{
+	tuple->cols = count;
+	tuple->columns = (char **) calloc(count, sizeof(char *));
+
+	if (tuple->columns == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	/*
+	 * Allocate the tuple values, an array of VALUES, as in SQL.
+	 *
+	 * TODO: actually support multi-values clauses (single column names array,
+	 * multiple VALUES matching the same metadata definition). At the moment
+	 * it's always a single VALUES entry: VALUES(a, b, c).
+	 *
+	 * The goal is to be able to represent VALUES(a1, b1, c1), (a2, b2, c2).
+	 */
+	LogicalMessageValuesArray *valuesArray = &(tuple->values);
+
+	valuesArray->count = 1;
+	valuesArray->array =
+		(LogicalMessageValues *) calloc(1, sizeof(LogicalMessageValues));
+
+	if (valuesArray->array == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	/* allocate one VALUES entry */
+	LogicalMessageValues *values = &(tuple->values.array[0]);
+	values->cols = count;
+	values->array =
+		(LogicalMessageValue *) calloc(count, sizeof(LogicalMessageValue));
+
+	if (values->array == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -1720,9 +1785,12 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 		{
 			LogicalMessageValues *values = &(new->values.array[r]);
 
+			bool first = true;
+
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
 			{
+				const char *colname = new->columns[v];
 				LogicalMessageValue *value = &(values->array[v]);
 
 				if (new->cols <= v)
@@ -1734,13 +1802,44 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 					return false;
 				}
 
-				FFORMAT(out, "%s", v > 0 ? ", " : "");
-				FFORMAT(out, "\"%s\" = ", new->columns[v]);
+				/*
+				 * Avoid SET "id" = 1 WHERE "id" = 1 ; so for that we lookup
+				 * for a column with the same name in the old parts, and with
+				 * the same value too.
+				 */
+				bool skip = false;
 
-				if (!stream_write_value(out, value))
+				for (int oc = 0; oc < old->cols; oc++)
 				{
-					/* errors have already been logged */
-					return false;
+					if (streq(old->columns[oc], colname))
+					{
+						/* only works because old->values.count == 1 */
+						LogicalMessageValue *oldValue =
+							&(old->values.array[0].array[v]);
+
+						if (LogicalMessageValueEq(oldValue, value))
+						{
+							skip = true;
+							break;
+						}
+					}
+				}
+
+				if (!skip)
+				{
+					FFORMAT(out, "%s", first ? "" : ", ");
+					FFORMAT(out, "\"%s\" = ", colname);
+
+					if (first)
+					{
+						first = false;
+					}
+
+					if (!stream_write_value(out, value))
+					{
+						/* errors have already been logged */
+						return false;
+					}
 				}
 			}
 		}
@@ -1873,7 +1972,7 @@ stream_write_value(FILE *out, LogicalMessageValue *value)
 		{
 			case BOOLOID:
 			{
-				fformat(out, "'%s' ", value->val.boolean ? "t" : "f");
+				fformat(out, "'%s'", value->val.boolean ? "t" : "f");
 				break;
 			}
 
@@ -1913,6 +2012,65 @@ stream_write_value(FILE *out, LogicalMessageValue *value)
 	}
 
 	return true;
+}
+
+
+/*
+ * LogicalMessageValueEq compares two LogicalMessageValue instances and return
+ * true when they represent the same value. NULL are considered Equal, like in
+ * the SQL operator IS NOT DISTINCT FROM.
+ */
+bool
+LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
+{
+	if (a->oid != b->oid)
+	{
+		return false;
+	}
+
+	if (a->isNull != b->isNull)
+	{
+		return false;
+	}
+
+	if (a->isNull && b->isNull)
+	{
+		return true;
+	}
+
+	switch (a->oid)
+	{
+		case BOOLOID:
+		{
+			return a->val.boolean == b->val.boolean;
+		}
+
+		case INT8OID:
+		{
+			return a->val.int8 == a->val.int8;
+		}
+
+		case FLOAT8OID:
+		{
+			return a->val.float8 == b->val.float8;
+		}
+
+		case TEXTOID:
+		case BYTEAOID:
+		{
+			return a->isQuoted == b->isQuoted &&
+				   streq(a->val.str, b->val.str);
+		}
+
+		default:
+		{
+			log_error("BUG: LogicalMessageValueEq a.oid == %d", a->oid);
+			return false;
+		}
+	}
+
+	/* makes compiler happy */
+	return false;
 }
 
 
