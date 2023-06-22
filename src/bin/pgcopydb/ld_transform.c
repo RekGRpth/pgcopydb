@@ -1988,7 +1988,6 @@ stream_write_value(FILE *out, LogicalMessageValue *value)
 				break;
 			}
 
-			case TEXTOID:
 			case BYTEAOID:
 			{
 				if (value->isQuoted)
@@ -1998,6 +1997,25 @@ stream_write_value(FILE *out, LogicalMessageValue *value)
 				else
 				{
 					fformat(out, "'%s'", value->val.str);
+				}
+
+				break;
+			}
+
+			case TEXTOID:
+			{
+				if (value->isQuoted)
+				{
+					fformat(out, "%s", value->val.str);
+				}
+				else
+				{
+					const char *str = value->val.str;
+					if (!stream_write_sql_escape_string_constant(out, str))
+					{
+						log_error("Failed to write escaped string: E'%s'", str);
+						return false;
+					}
 				}
 				break;
 			}
@@ -2010,6 +2028,47 @@ stream_write_value(FILE *out, LogicalMessageValue *value)
 			}
 		}
 	}
+
+	return true;
+}
+
+
+/*
+ * stream_write_sql_escape_string_constant writes given str to out and follows
+ * the Postgres syntax for String Constants With C-Style Escapes, as documented
+ * at the following URL:
+ *
+ * https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS
+ */
+bool
+stream_write_sql_escape_string_constant(FILE *out, const char *str)
+{
+	fformat(out, "E'");
+
+	for (int i = 0; str[i] != '\0'; i++)
+	{
+		switch (str[i])
+		{
+			case '\'':
+			case '\b':
+			case '\f':
+			case '\n':
+			case '\r':
+			case '\t':
+			{
+				fformat(out, "\\%c", str[i]);
+				break;
+			}
+
+			default:
+			{
+				fformat(out, "%c", str[i]);
+				break;
+			}
+		}
+	}
+
+	fformat(out, "'");
 
 	return true;
 }
@@ -2047,7 +2106,7 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 		case INT8OID:
 		{
-			return a->val.int8 == a->val.int8;
+			return a->val.int8 == b->val.int8;
 		}
 
 		case FLOAT8OID:
