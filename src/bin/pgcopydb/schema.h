@@ -200,13 +200,19 @@ typedef struct SourceTableArray
 typedef struct SourceSequence
 {
 	uint32_t oid;
-	uint32_t attroid;           /* pg_attrdef default value OID */
+	uint32_t ownedby;           /* pg_class oid of OWNED BY table */
+	uint32_t attrelid;          /* pg_class oid of table using as DEFAULT */
+	uint32_t attroid;           /* pg_attrdef DEFAULT value OID */
+
+	char qname[NAMEDATALEN * 2 + 5 + 1];
 	char nspname[NAMEDATALEN];
 	char relname[NAMEDATALEN];
 	int64_t lastValue;
 	bool isCalled;
 
 	char restoreListName[RESTORE_LIST_NAMEDATALEN];
+
+	UT_hash_handle hh;          /* makes this structure hashable */
 } SourceSequence;
 
 
@@ -233,6 +239,8 @@ typedef struct SourceIndex
 	char *indexColumns;         /* malloc'ed area */
 	char *indexDef;             /* malloc'ed area */
 	uint32_t constraintOid;
+	bool condeferrable;
+	bool condeferred;
 	char constraintName[NAMEDATALEN];
 	char *constraintDef;        /* malloc'ed area */
 	char indexRestoreListName[RESTORE_LIST_NAMEDATALEN];
@@ -297,6 +305,7 @@ typedef struct SourceCatalog
 	SourceTable *sourceTableHashByOid;
 	SourceTable *sourceTableHashByQName;
 	SourceIndex *sourceIndexHashByOid;
+	SourceSequence *sourceSeqHashByOid;
 } SourceCatalog;
 
 
