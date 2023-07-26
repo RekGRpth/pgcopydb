@@ -28,7 +28,13 @@
 
 
 static bool prepareFilters(PGSQL *pgsql, SourceFilters *filters);
-static bool prepareFilterCopyExcludeSchema(PGSQL *pgsql, SourceFilters *filters);
+
+static bool prepareFilterCopyIncludeOnlySchema(PGSQL *pgsql,
+											   SourceFilters *filters);
+
+static bool prepareFilterCopyExcludeSchema(PGSQL *pgsql,
+										   SourceFilters *filters);
+
 static bool prepareFilterCopyTableList(PGSQL *pgsql,
 									   SourceFilterTableList *tableList,
 									   const char *temp_table_name);
@@ -114,6 +120,7 @@ typedef struct SourcePartitionContext
 	bool parsedOk;
 } SourcePartitionContext;
 
+
 static void getSchemaList(void *ctx, PGresult *result);
 
 static void getDatabaseList(void *ctx, PGresult *result);
@@ -164,6 +171,8 @@ static void getPartitionList(void *ctx, PGresult *result);
 static bool parseCurrentPartition(PGresult *result,
 								  int rowNumber,
 								  SourceTableParts *parts);
+
+static void getTableChecksum(void *ctx, PGresult *result);
 
 struct FilteringQueries
 {
@@ -756,40 +765,39 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 	}
 
 	char *tablename = "pgcopydb_table_size";
-	char sql[BUFSIZE] = { 0 };
-	int len = 0;
+	PQExpBuffer sql = createPQExpBuffer();
 
 	if (cache)
 	{
-		len =
-			sformat(sql, sizeof(sql),
-					"create table if not exists pgcopydb.%s as %s",
-					tablename,
-					listSourceTableSizeSQL[filters->type].sql);
+		appendPQExpBuffer(sql,
+						  "create table if not exists pgcopydb.%s as %s",
+						  tablename,
+						  listSourceTableSizeSQL[filters->type].sql);
 	}
 	else
 	{
-		len =
-			sformat(sql, sizeof(sql),
-					"create temp table %s  on commit drop as %s",
-					tablename,
-					listSourceTableSizeSQL[filters->type].sql);
+		appendPQExpBuffer(sql,
+						  "create temp table %s  on commit drop as %s",
+						  tablename,
+						  listSourceTableSizeSQL[filters->type].sql);
 	}
 
-	if (sizeof(sql) <= len)
+	if (PQExpBufferBroken(sql))
 	{
 		log_error("Failed to prepare create pgcopydb_table_size query "
-				  "buffer: %lld bytes are needed, we allocated %lld only",
-				  (long long) len,
-				  (long long) sizeof(sql));
+				  "buffer: Out of Memory");
+		(void) destroyPQExpBuffer(sql);
 		return false;
 	}
 
-	if (!pgsql_execute(pgsql, sql))
+	if (!pgsql_execute(pgsql, sql->data))
 	{
 		log_error("Failed to compute table size, see above for details");
+		(void) destroyPQExpBuffer(sql);
 		return false;
 	}
+
+	(void) destroyPQExpBuffer(sql);
 
 	char *createIndex = "create index on pgcopydb_table_size(oid)";
 
@@ -2233,7 +2241,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2290,7 +2298,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2361,7 +2369,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2421,7 +2429,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2486,7 +2494,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2546,7 +2554,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	},
 
 	{
@@ -2603,7 +2611,7 @@ struct FilteringQueries listSourceIndexesSQL[] = {
 		"            and d.deptype = 'e' "
 		"       ) "
 
-		" order by n.nspname, r.relname"
+		" order by n.nspname, r.relname, i.relname"
 	}
 };
 
@@ -2702,7 +2710,7 @@ schema_list_table_indexes(PGSQL *pgsql,
 		"      and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'"
 		"      and n.nspname !~ 'pgcopydb' "
 		"      and rn.nspname = $1 and r.relname = $2"
-		" order by n.nspname, r.relname";
+		" order by n.nspname, r.relname, i.relname";
 
 	int paramCount = 2;
 	Oid paramTypes[2] = { TEXTOID, TEXTOID };
@@ -3039,6 +3047,88 @@ schema_list_partitions(PGSQL *pgsql, SourceTable *table, uint64_t partSize)
 
 
 /*
+ * schema_checksum_table runs a SQL query that computes the number of rows of a
+ * table and also a checksum for all the rows contents.
+ */
+bool
+schema_checksum_table(PGSQL *pgsql, SourceTable *table)
+{
+	SourcePartitionContext parseContext = { { 0 }, table, false };
+
+	if (table->attributes.count == 0)
+	{
+		char sql[BUFSIZE] = { 0 };
+
+		sformat(sql, sizeof(sql),
+				"select count(1) as cnt, 0 as chksum from only %s",
+				table->qname);
+
+		if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
+									   &parseContext, &getTableChecksum))
+		{
+			log_error("Failed to compute checksum for table %s", table->qname);
+			return false;
+		}
+
+		return true;
+	}
+
+	/* first prepare the column list */
+	PQExpBuffer attrList = createPQExpBuffer();
+
+	appendPQExpBuffer(attrList, "(");
+
+	for (int c = 0; c < table->attributes.count; c++)
+	{
+		char *srcAttName = table->attributes.array[c].attname;
+
+		appendPQExpBuffer(attrList, "%s%s",
+						  c > 0 ? ", " : "",
+						  srcAttName);
+	}
+
+	appendPQExpBuffer(attrList, ")");
+
+	if (PQExpBufferBroken(attrList))
+	{
+		(void) destroyPQExpBuffer(attrList);
+		log_error("Failed to build attribute list: Out of Memory");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* now prepare the actual query */
+	PQExpBuffer sql = createPQExpBuffer();
+
+	appendPQExpBuffer(sql,
+					  "select count(1) as cnt, "
+					  "       sum(hashtext(%s::text)::bigint) as chksum "
+					  "  from only %s",
+					  attrList->data,
+					  table->qname);
+
+	if (PQExpBufferBroken(sql))
+	{
+		(void) destroyPQExpBuffer(attrList);
+		(void) destroyPQExpBuffer(sql);
+		log_error("Failed to build attribute list: Out of Memory");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!pgsql_execute_with_params(pgsql, sql->data, 0, NULL, NULL,
+								   &parseContext, &getTableChecksum))
+	{
+		log_error("Failed to compute checksum for table %s", table->qname);
+		(void) destroyPQExpBuffer(sql);
+		return false;
+	}
+
+	(void) destroyPQExpBuffer(sql);
+
+	return true;
+}
+
+
+/*
  * prepareFilters prepares the temporary tables that are needed on the Postgres
  * session where we want to implement a catalog query with filtering. The
  * filtering rules are then uploaded in those temp tables, and the filtering is
@@ -3075,6 +3165,7 @@ prepareFilters(PGSQL *pgsql, SourceFilters *filters)
 	 */
 	char *tempTables[] = {
 		"create temp table filter_exclude_schema(nspname name)",
+		"create temp table filter_include_only_schema(nspname name)",
 		"create temp table filter_include_only_table(nspname name, relname name)",
 		"create temp table filter_exclude_table(nspname name, relname name)",
 		"create temp table filter_exclude_table_data(nspname name, relname name)",
@@ -3094,6 +3185,12 @@ prepareFilters(PGSQL *pgsql, SourceFilters *filters)
 	/*
 	 * Now, fill-in the temp tables with the data that we have.
 	 */
+	if (!prepareFilterCopyIncludeOnlySchema(pgsql, filters))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (!prepareFilterCopyExcludeSchema(pgsql, filters))
 	{
 		/* errors have already been logged */
@@ -3104,9 +3201,9 @@ prepareFilters(PGSQL *pgsql, SourceFilters *filters)
 	{
 		char *name;
 		SourceFilterTableList *list;
-	};
-
-	struct name_list_pair nameListPair[] = {
+	}
+	nameListPair[] =
+	{
 		{ "filter_include_only_table", &(filters->includeOnlyTableList) },
 		{ "filter_exclude_table", &(filters->excludeTableList) },
 		{ "filter_exclude_table_data", &(filters->excludeTableDataList) },
@@ -3140,6 +3237,11 @@ prepareFilters(PGSQL *pgsql, SourceFilters *filters)
 static bool
 prepareFilterCopyExcludeSchema(PGSQL *pgsql, SourceFilters *filters)
 {
+	if (filters->excludeSchemaList.count == 0)
+	{
+		return true;
+	}
+
 	char *qname = "\"pg_temp\".\"filter_exclude_schema\"";
 
 	if (!pg_copy_from_stdin(pgsql, qname))
@@ -3162,6 +3264,66 @@ prepareFilterCopyExcludeSchema(PGSQL *pgsql, SourceFilters *filters)
 	if (!pg_copy_end(pgsql))
 	{
 		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * prepareFilterCopyIncludeOnlySchema sends a COPY from STDIN query and then
+ * uploads the local filters that we have in the
+ * pg_temp.filter_include_only_schema table.
+ *
+ * Then it prepares the pg_temp.filter_exclude_schema table with all the schema
+ * names found in pg_namespace that are not in the include-only-schema list.
+ */
+static bool
+prepareFilterCopyIncludeOnlySchema(PGSQL *pgsql, SourceFilters *filters)
+{
+	if (filters->includeOnlySchemaList.count == 0)
+	{
+		return true;
+	}
+
+	char *qname = "\"pg_temp\".\"filter_include_only_schema\"";
+
+	if (!pg_copy_from_stdin(pgsql, qname))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
+	{
+		char *nspname = filters->includeOnlySchemaList.array[i].nspname;
+
+		if (!pg_copy_row_from_stdin(pgsql, "s", nspname))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	if (!pg_copy_end(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char *sql =
+		"insert into \"pg_temp\".\"filter_exclude_schema\" "
+		"     select n.nspname "
+		"       from pg_namespace n "
+		"  left join \"pg_temp\".\"filter_include_only_schema\" inc "
+		"         on n.nspname = inc.nspname "
+		"      where inc.nspname is null ";
+
+	if (!pgsql_execute(pgsql, sql))
+	{
+		log_error("Failed to prepare include-only-schema filters, "
+				  "see above for details");
 		return false;
 	}
 
@@ -4907,4 +5069,52 @@ parseCurrentPartition(PGresult *result, int rowNumber, SourceTableParts *parts)
 	}
 
 	return errors == 0;
+}
+
+
+/*
+ * getTableChecksum assigns the rowcount and checksum fields of a table from
+ * the result of an SQL query.
+ */
+static void
+getTableChecksum(void *ctx, PGresult *result)
+{
+	SourcePartitionContext *context = (SourcePartitionContext *) ctx;
+	int nTuples = PQntuples(result);
+	int errors = 0;
+
+	if (nTuples != 1)
+	{
+		log_error("Query returned %d columns, expected 1", nTuples);
+		context->parsedOk = false;
+		return;
+	}
+
+	if (PQnfields(result) != 2)
+	{
+		log_error("Query returned %d columns, expected 2", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	SourceTable *table = context->table;
+
+	/* 1. count */
+	char *value = PQgetvalue(result, 0, 0);
+
+	if (!stringToUInt64(value, &(table->rowcount)))
+	{
+		log_error("Invalid row count value: \"%s\"", value);
+		++errors;
+	}
+
+	value = PQgetvalue(result, 0, 1);
+
+	if (!stringToUInt64(value, &(table->checksum)))
+	{
+		log_error("Invalid checksum value: \"%s\"", value);
+		++errors;
+	}
+
+	context->parsedOk = errors == 0;
 }
