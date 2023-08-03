@@ -532,4 +532,23 @@ bool vacuum_send_stop(CopyDataSpec *specs);
 bool prepare_summary_table(Summary *summary, CopyDataSpec *specs);
 bool print_summary(Summary *summary, CopyDataSpec *specs);
 
+/* compare.c */
+bool compare_schemas(CopyDataSpec *copySpecs);
+bool compare_data(CopyDataSpec *copySpecs);
+
+bool compare_start_workers(CopyDataSpec *copySpecs, Queue *queue);
+bool compare_queue_tables(CopyDataSpec *copySpecs, Queue *queue);
+bool compare_data_worker(CopyDataSpec *copySpecs, Queue *queue);
+bool compare_data_by_table_oid(CopyDataSpec *copySpecs, uint32_t oid);
+
+bool compare_read_tables_sums(CopyDataSpec *copySpecs);
+bool compare_table(CopyDataSpec *copySpecs, SourceTable *source);
+
+bool compare_fetch_schemas(CopyDataSpec *copySpecs,
+						   CopyDataSpec *sourceSpecs,
+						   CopyDataSpec *targetSpecs);
+
+bool compare_write_checksum(SourceTable *table, const char *filename);
+bool compare_read_checksum(SourceTable *table, const char *filename);
+
 #endif  /* COPYDB_H */
