@@ -95,13 +95,6 @@ stream_transform_stream(StreamSpecs *specs)
 		.ctx = &ctx
 	};
 
-	/* switch out stream from block buffered to line buffered mode */
-	if (setvbuf(privateContext->out, NULL, _IOLBF, 0) != 0)
-	{
-		log_error("Failed to set stdout to line buffered mode: %m");
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
 	if (!read_from_stream(privateContext->in, &context))
 	{
 		log_error("Failed to transform JSON messages from input stream, "
@@ -485,8 +478,6 @@ stream_transform_rotate(StreamContext *privateContext)
 bool
 stream_transform_worker(StreamSpecs *specs)
 {
-	log_notice("Started Stream Transform worker %d [%d]", getpid(), getppid());
-
 	/*
 	 * The timeline and wal segment size are determined when connecting to the
 	 * source database, and stored to local files at that time. When the Stream
@@ -495,6 +486,12 @@ stream_transform_worker(StreamSpecs *specs)
 	 */
 	if (!stream_read_context(&(specs->paths), &(specs->system), &(specs->WalSegSz)))
 	{
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			log_debug("Stream Transform Worker startup was interrupted");
+			return true;
+		}
+
 		log_error("Failed to read the streaming context information "
 				  "from the source database, see above for details");
 		return false;

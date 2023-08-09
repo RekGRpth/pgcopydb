@@ -322,10 +322,13 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 * sequences, not the ones that were current when the main snapshot was
 	 * exported.
 	 */
-	if (!follow_reset_sequences(copySpecs, &streamSpecs))
+	if (success)
 	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_TARGET);
+		if (!follow_reset_sequences(copySpecs, &streamSpecs))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_TARGET);
+		}
 	}
 
 	/* make sure all sub-processes are now finished */
@@ -634,20 +637,20 @@ start_follow_process(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs,
 	 * been updated from a previous run of the command, and we might have
 	 * nothing to catch-up to when e.g. the endpos was reached already.
 	 */
-	CopyDBSentinel sentinel = { 0 };
+	CopyDBSentinel *sentinel = &(streamSpecs->sentinel);
 
-	if (!follow_init_sentinel(streamSpecs, &sentinel))
+	if (!follow_init_sentinel(streamSpecs, sentinel))
 	{
-		/* errors have already been logged */
+		log_error("Failed to initialise sentinel, see above for details");
 		return false;
 	}
 
-	if (sentinel.endpos != InvalidXLogRecPtr &&
-		sentinel.endpos <= sentinel.replay_lsn)
+	if (sentinel->endpos != InvalidXLogRecPtr &&
+		sentinel->endpos <= sentinel->replay_lsn)
 	{
 		log_info("Current endpos %X/%X was previously reached at %X/%X",
-				 LSN_FORMAT_ARGS(sentinel.endpos),
-				 LSN_FORMAT_ARGS(sentinel.replay_lsn));
+				 LSN_FORMAT_ARGS(sentinel->endpos),
+				 LSN_FORMAT_ARGS(sentinel->replay_lsn));
 
 		return true;
 	}
@@ -698,6 +701,7 @@ cli_clone_follow_wait_subprocess(const char *name, pid_t pid)
 {
 	bool exited = false;
 	int returnCode = -1;
+	int sig = 0;
 
 	if (pid < 0)
 	{
@@ -707,7 +711,7 @@ cli_clone_follow_wait_subprocess(const char *name, pid_t pid)
 
 	while (!exited)
 	{
-		if (!follow_wait_pid(pid, &exited, &returnCode))
+		if (!follow_wait_pid(pid, &exited, &returnCode, &sig))
 		{
 			/* errors have already been logged */
 			return false;
