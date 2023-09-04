@@ -49,7 +49,7 @@ copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql)
 		/* add the current sequence to the sequence Hash-by-OID */
 		HASH_ADD(hh, sourceSeqHashByOid, oid, sizeof(uint32_t), seq);
 
-		sformat(seq->qname, sizeof(seq->qname), "\"%s\".\"%s\"",
+		sformat(seq->qname, sizeof(seq->qname), "%s.%s",
 				seq->nspname,
 				seq->relname);
 
@@ -127,6 +127,8 @@ copydb_start_seq_process(CopyDataSpec *specs)
 		case 0:
 		{
 			/* child process runs the command */
+			(void) set_ps_title("pgcopydb: copy sequences");
+
 			if (!copydb_copy_all_sequences(specs))
 			{
 				/* errors have already been logged */
@@ -197,7 +199,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs)
 
 		char qname[BUFSIZE] = { 0 };
 
-		sformat(qname, sizeof(qname), "\"%s\".\"%s\"",
+		sformat(qname, sizeof(qname), "%s.%s",
 				seq->nspname,
 				seq->relname);
 

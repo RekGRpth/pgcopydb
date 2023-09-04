@@ -213,7 +213,7 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 	{
 		SourceTable *source = &(tableArray->array[tableIndex]);
 
-		appendPQExpBuffer(query, "%s \"%s\".\"%s\"",
+		appendPQExpBuffer(query, "%s %s.%s",
 						  tableIndex == 0 ? " " : ",",
 						  source->nspname,
 						  source->relname);
@@ -241,6 +241,7 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 	if (!pgsql_execute(&dst, query->data))
 	{
 		/* errors have already been logged */
+		destroyPQExpBuffer(query);
 		return false;
 	}
 
@@ -404,6 +405,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 				log_error("Failed to check if restore name \"%s\" "
 						  "already exists",
 						  name);
+				destroyPQExpBuffer(listContents);
 				return false;
 			}
 

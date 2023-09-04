@@ -54,6 +54,8 @@ vacuum_start_workers(CopyDataSpec *specs)
 			case 0:
 			{
 				/* child process runs the command */
+				(void) set_ps_title("pgcopydb: vacuum worker");
+
 				if (!vacuum_worker(specs))
 				{
 					/* errors have already been logged */
@@ -212,9 +214,14 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 	char vacuum[BUFSIZE] = { 0 };
 
 	sformat(vacuum, sizeof(vacuum),
-			"VACUUM ANALYZE \"%s\".\"%s\"",
+			"VACUUM ANALYZE %s.%s",
 			table.nspname,
 			table.relname);
+
+	/* also set the process title for this specific table */
+	char psTitle[BUFSIZE] = { 0 };
+	sformat(psTitle, sizeof(psTitle), "pgcopydb: %s", vacuum);
+	(void) set_ps_title(psTitle);
 
 	log_notice("%s;", vacuum);
 

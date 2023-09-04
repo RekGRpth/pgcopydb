@@ -47,6 +47,8 @@ copydb_start_extension_data_process(CopyDataSpec *specs)
 		case 0:
 		{
 			/* child process runs the command */
+			(void) set_ps_title("pgcopydb: extension data");
+
 			bool createExtensions = false;
 
 			if (!copydb_copy_extensions(specs, createExtensions))
@@ -148,7 +150,7 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 				/* apply extcondition to the source table */
 				char qname[NAMEDATALEN * 2 + 5] = { 0 };
 
-				sformat(qname, sizeof(qname), "\"%s\".\"%s\"",
+				sformat(qname, sizeof(qname), "%s.%s",
 						config->nspname,
 						config->relname);
 
