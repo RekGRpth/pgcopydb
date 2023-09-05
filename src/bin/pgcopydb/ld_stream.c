@@ -2045,6 +2045,7 @@ buildReplicationURI(const char *pguri, char **repl_pguri)
 
 	/* if replication is already found, we override it to value "1" */
 	if (!parse_pguri_info_key_vals(pguri,
+								   &connStringDefaults,
 								   &replicationParams,
 								   &params,
 								   checkForCompleteURI))
