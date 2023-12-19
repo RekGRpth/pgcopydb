@@ -721,13 +721,13 @@ catalog_create_schema(DatabaseCatalog *catalog)
 	{
 		char *ddl = createDDLs[i];
 
-		log_sqlite("catalog_init: %s", ddl);
+		log_sqlite("catalog_create_schema: %s", ddl);
 
 		int rc = sqlite3_exec(catalog->db, ddl, NULL, NULL, NULL);
 
 		if (rc != SQLITE_OK)
 		{
-			log_error("Failed to init catalogs: %s", ddl);
+			log_error("Failed to create catalog schema: %s", ddl);
 			log_error("%s", sqlite3_errmsg(catalog->db));
 			return false;
 		}
@@ -771,7 +771,7 @@ catalog_drop_schema(DatabaseCatalog *catalog)
 
 		default:
 		{
-			log_error("BUG: called catalog_init for unknown type %d",
+			log_error("BUG: called catalog_drop_schema for unknown type %d",
 					  catalog->type);
 			return false;
 		}
@@ -781,7 +781,7 @@ catalog_drop_schema(DatabaseCatalog *catalog)
 	{
 		char *ddl = dropDDLs[i];
 
-		log_sqlite("catalog_init: %s", ddl);
+		log_sqlite("catalog_drop_schema: %s", ddl);
 
 		int rc = sqlite3_exec(catalog->db, ddl, NULL, NULL, NULL);
 
@@ -3654,7 +3654,7 @@ catalog_s_table_count_indexes(DatabaseCatalog *catalog, SourceTable *table)
 
 	char *sql =
 		"select count(1) as indexes, "
-		"       count(1) filter(where c.oid is not null) as constraints "
+		"       count(c.oid) as constraints "
 		"  from s_index i "
 		"       left join s_constraint c on c.indexoid = i.oid "
 		" where tableoid = $1";
@@ -4213,6 +4213,11 @@ catalog_prepare_filter(DatabaseCatalog *catalog)
 
 		"     select oid, restore_list_name, 'index' "
 		"       from s_index "
+
+		"  union all "
+
+		"     select oid, extname, 'extension' "
+		"       from s_extension "
 
 		"  union all "
 
