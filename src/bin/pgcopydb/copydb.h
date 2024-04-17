@@ -446,6 +446,7 @@ bool copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 
 bool copydb_table_create_lockfile(CopyDataSpec *specs,
 								  CopyTableDataSpec *tableSpecs,
+								  PGSQL *dst,
 								  bool *isDone);
 
 bool copydb_mark_table_as_done(CopyDataSpec *specs,
@@ -460,6 +461,7 @@ bool copydb_prepare_copy_query(CopyTableDataSpec *tableSpecs, CopyArgs *args);
 
 bool copydb_prepare_summary_command(CopyTableDataSpec *tableSpecs);
 
+bool copydb_check_table_exists(PGSQL *pgsql, SourceTable *table, bool *exists);
 
 /* blobs.c */
 bool copydb_start_blob_process(CopyDataSpec *specs);

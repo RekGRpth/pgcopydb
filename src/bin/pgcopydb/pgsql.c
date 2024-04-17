@@ -1330,6 +1330,44 @@ pgsql_has_sequence_privilege(PGSQL *pgsql,
 
 
 /*
+ * pgsql_has_table_privilege calls has_table_privilege() and copies the result
+ * in the granted boolean pointer given.
+ */
+bool
+pgsql_has_table_privilege(PGSQL *pgsql,
+						  const char *tablename,
+						  const char *privilege,
+						  bool *granted)
+{
+	SingleValueResultContext parseContext = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *sql = "select has_table_privilege($1, $2);";
+
+	int paramCount = 2;
+	Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { tablename, privilege };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &parseContext, &parseSingleValueResult))
+	{
+		log_error("Failed to query privileges for table \"%s\"", tablename);
+		return false;
+	}
+
+	if (!parseContext.parsedOk)
+	{
+		log_error("Failed to query privileges for table \"%s\"", tablename);
+		return false;
+	}
+
+	*granted = parseContext.boolVal;
+
+	return true;
+}
+
+
+/*
  * pgsql_get_search_path runs the query "show search_path" and copies the
  * result in the given pre-allocated string buffer.
  */
@@ -2604,6 +2642,23 @@ validate_connection_string(const char *connectionString)
 
 
 /*
+ * pgsql_lock_table runs a LOCK command with given lockmode.
+ */
+bool
+pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode)
+{
+	char sql[BUFSIZE] = { 0 };
+
+	sformat(sql, sizeof(sql), "LOCK TABLE ONLY %s IN %s MODE", qname, lockmode);
+
+	/* this is an internal operation, not meaningful from the outside */
+	log_sql("%s", sql);
+
+	return pgsql_execute(pgsql, sql);
+}
+
+
+/*
  * pgsql_truncate executes the TRUNCATE command on the given quoted relation
  * name qname, in the given Postgres connection.
  */
@@ -2614,7 +2669,8 @@ pgsql_truncate(PGSQL *pgsql, const char *qname)
 
 	sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
 
-	log_sql("%s", sql);
+	/* this being more like a DDL operation, proper log level is NOTICE */
+	log_notice("%s", sql);
 
 	return pgsql_execute(pgsql, sql);
 }
@@ -2686,6 +2742,9 @@ pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args)
 			return false;
 		}
 	}
+
+	/* make sure to log TRUNCATE before we log COPY, avoid confusion */
+	log_notice("%s", args->logCommand);
 
 	/* SRC: COPY schema.table TO STDOUT */
 	if (!pg_copy_send_query(src, args, PGRES_COPY_OUT))
@@ -5359,6 +5418,7 @@ parseReplicationSlot(void *ctx, PGresult *result)
  */
 bool
 pgsql_table_exists(PGSQL *pgsql,
+				   uint32_t oid,
 				   const char *nspname,
 				   const char *relname,
 				   bool *exists)
@@ -5370,13 +5430,18 @@ pgsql_table_exists(PGSQL *pgsql,
 		"         select 1 "
 		"           from pg_class c "
 		"                join pg_namespace n on n.oid = c.relnamespace "
-		"          where n.nspname = $1 "
-		"            and c.relname = $2"
+		"          where c.oid = $1 "
+		"            and format('%I', n.nspname) = $2 "
+		"            and format('%I', c.relname) = $3"
 		"       )";
 
-	int paramCount = 2;
-	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
-	const char *paramValues[2] = { nspname, relname };
+	int paramCount = 3;
+	const Oid paramTypes[3] = { OIDOID, TEXTOID, TEXTOID };
+	const char *paramValues[3] = { 0 };
+
+	paramValues[0] = intToString(oid).strValue;
+	paramValues[1] = nspname;
+	paramValues[2] = relname;
 
 	if (!pgsql_execute_with_params(pgsql, existsQuery,
 								   paramCount, paramTypes, paramValues,

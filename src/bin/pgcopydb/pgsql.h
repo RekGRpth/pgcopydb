@@ -285,6 +285,11 @@ bool pgsql_has_sequence_privilege(PGSQL *pgsql,
 								  const char *privilege,
 								  bool *granted);
 
+bool pgsql_has_table_privilege(PGSQL *pgsql,
+							   const char *tablename,
+							   const char *privilege,
+							   bool *granted);
+
 bool pgsql_get_search_path(PGSQL *pgsql, char *search_path, size_t size);
 bool pgsql_set_search_path(PGSQL *pgsql, char *search_path, bool local);
 bool pgsql_prepend_search_path(PGSQL *pgsql, const char *namespace);
@@ -317,6 +322,8 @@ void pgAutoCtlDebugNoticeProcessor(void *arg, const char *message);
 
 bool validate_connection_string(const char *connectionString);
 
+bool pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode);
+
 bool pgsql_truncate(PGSQL *pgsql, const char *qname);
 
 typedef struct CopyArgs
@@ -326,6 +333,7 @@ typedef struct CopyArgs
 	char *srcWhereClause;
 	char *dstQname;
 	char *dstAttrList;
+	char *logCommand;
 	bool truncate;
 	bool freeze;
 	uint64_t bytesTransmitted;
@@ -557,6 +565,7 @@ bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
 bool pgsql_configuration_exists(PGSQL *pgsql, const char *setconfig, bool *exists);
 
 bool pgsql_table_exists(PGSQL *pgsql,
+						uint32_t oid,
 						const char *relname,
 						const char *nspname,
 						bool *exists);
