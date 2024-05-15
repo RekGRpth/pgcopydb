@@ -262,7 +262,7 @@ summary_lookup_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
 	BindParam params[] = {
 		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
 
-		{ BIND_PARAMETER_TYPE_TEXT, "partnum",
+		{ BIND_PARAMETER_TYPE_INT64, "partnum",
 		  table->partition.partNumber, NULL },
 	};
 
@@ -354,7 +354,7 @@ summary_delete_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
 		return false;
 	}
 
-	char *sql = "delete from summary where tableoid = $1 and partnumber = $2";
+	char *sql = "delete from summary where tableoid = $1 and partnum = $2";
 
 	if (!semaphore_lock(&(catalog->sema)))
 	{
@@ -2262,9 +2262,16 @@ summary_iter_timing(DatabaseCatalog *catalog,
 
 	iter->catalog = catalog;
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (!summary_iter_timing_init(iter))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
@@ -2273,6 +2280,7 @@ summary_iter_timing(DatabaseCatalog *catalog,
 		if (!summary_iter_timing_next(iter))
 		{
 			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 
@@ -2283,6 +2291,7 @@ summary_iter_timing(DatabaseCatalog *catalog,
 			if (!summary_iter_timing_finish(iter))
 			{
 				/* errors have already been logged */
+				(void) semaphore_unlock(&(catalog->sema));
 				return false;
 			}
 
@@ -2294,10 +2303,12 @@ summary_iter_timing(DatabaseCatalog *catalog,
 		{
 			log_error("Failed to iterate over list of timings, "
 					  "see above for details");
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 	}
 
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
