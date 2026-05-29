@@ -1256,6 +1256,49 @@ pgsql_has_table_privilege(PGSQL *pgsql,
 
 
 /*
+ * pgsql_get_table_relkind queries pg_class for the relkind of the given
+ * qualified table name and copies it to the given char pointer. Callers
+ * should pass a fully-qualified schema.table to avoid search_path surprises;
+ * the regclass cast on $1 will otherwise resolve via search_path.
+ */
+bool
+pgsql_get_table_relkind(PGSQL *pgsql, const char *qname, char *relkind)
+{
+	SingleValueResultContext parseContext = { { 0 }, PGSQL_RESULT_STRING, false };
+
+	char *sql = "select relkind from pg_class where oid = $1::regclass;";
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { qname };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &parseContext, &parseSingleValueResult))
+	{
+		log_error("Failed to query pg_class for relkind of table %s "
+				  "(query failed: connection or permission error, or "
+				  "the regclass cast did not resolve a relation)", qname);
+		return false;
+	}
+
+	if (!parseContext.parsedOk)
+	{
+		log_error("Failed to parse relkind result for table %s "
+				  "(expected 1 row, got %d)",
+				  qname, parseContext.ntuples);
+		return false;
+	}
+
+	*relkind = parseContext.strVal[0];
+
+	free(parseContext.strVal);
+
+	return true;
+}
+
+
+/*
  * pgsql_get_search_path runs the query "show search_path" and copies the
  * result in the given pre-allocated string buffer.
  */
@@ -2606,13 +2649,31 @@ pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode)
 /*
  * pgsql_truncate executes the TRUNCATE command on the given quoted relation
  * name qname, in the given Postgres connection.
+ *
+ * When the target relation is a partitioned table (relkind 'p') we issue
+ * TRUNCATE without ONLY: Postgres rejects TRUNCATE ONLY on partitioned tables
+ * with "cannot truncate only a partitioned table". This handles the asymmetric
+ * case where the source has a flat table but the target is partitioned. The
+ * source-side partition filter (PR #863) only handles the symmetric case where
+ * both source and target are partitioned, so this runtime check covers the gap.
+ *
+ * The caller passes the target's relkind (looked up via
+ * pgsql_get_table_relkind). Callers that don't know it look it up themselves
+ * to keep this function predictable and side-effect-free.
  */
 bool
-pgsql_truncate(PGSQL *pgsql, const char *qname)
+pgsql_truncate(PGSQL *pgsql, const char *qname, char relkind)
 {
 	char sql[BUFSIZE] = { 0 };
 
-	sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
+	if (relkind == 'p')
+	{
+		sformat(sql, sizeof(sql), "TRUNCATE %s", qname);
+	}
+	else
+	{
+		sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
+	}
 
 	/* this being more like a DDL operation, proper log level is NOTICE */
 	log_notice("%s", sql);
@@ -2683,9 +2744,21 @@ pg_copy_data(PGSQL *src, PGSQL *dst,
 		return false;
 	}
 
+	/*
+	 * Look up the target relkind once: TRUNCATE and COPY FREEZE both need it
+	 * to avoid Postgres errors on partitioned tables. '\0' on lookup failure
+	 * falls back to the flat-table path (TRUNCATE ONLY, freeze unchanged).
+	 */
+	char relkind = '\0';
+
+	if (args->truncate || args->freeze)
+	{
+		(void) pgsql_get_table_relkind(dst, args->dstQname, &relkind);
+	}
+
 	if (args->truncate)
 	{
-		if (!pgsql_truncate(dst, args->dstQname))
+		if (!pgsql_truncate(dst, args->dstQname, relkind))
 		{
 			/* errors have already been logged */
 			return false;
@@ -2694,9 +2767,18 @@ pg_copy_data(PGSQL *src, PGSQL *dst,
 
 	/*
 	 * COPY FREEZE is only accepted by Postgres if the table was created or
-	 * truncated in the current transaction.
+	 * truncated in the current transaction. It is also rejected on
+	 * partitioned tables ("cannot perform COPY FREEZE on a partitioned
+	 * table"), so disable it when the target relation is partitioned.
 	 */
 	args->freeze &= args->truncate;
+
+	if (args->freeze && relkind == 'p')
+	{
+		log_notice("disabling COPY FREEZE on partitioned target table %s",
+				   args->dstQname);
+		args->freeze = false;
+	}
 
 	/* make sure to log TRUNCATE before we log COPY, avoid confusion */
 	log_notice("%s", args->logCommand);
@@ -3421,24 +3503,58 @@ pg_copy_large_object(PGSQL *src,
 
 	/*
 	 * 3. Open the blob on the target database
+	 *
+	 *    In PostgreSQL 17+, pg_dump no longer outputs large object metadata
+	 *    in the pre-data section, so the large object may not exist yet.
+	 *    If opening fails, try creating it first.
 	 */
 	int dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
 
 	if (dstfd == -1)
 	{
-		char context[BUFSIZE] = { 0 };
+		/*
+		 * Large object doesn't exist yet (PG17+ behavior or fresh target).
+		 * Create it with the same OID as the source, then try opening again.
+		 */
+		log_debug("Large object %u not found on target, creating it", blobOid);
 
-		sformat(context, sizeof(context),
-				"Failed to open new large object %u", blobOid);
+		Oid createdOid = lo_create(dst->connection, blobOid);
 
-		(void) pgcopy_log_error(dst, NULL, context);
+		if (createdOid != blobOid)
+		{
+			char context[BUFSIZE] = { 0 };
 
-		lo_close(src->connection, srcfd);
+			sformat(context, sizeof(context),
+					"Failed to create large object %u on target", blobOid);
 
-		pgsql_finish(src);
-		pgsql_finish(dst);
+			(void) pgcopy_log_error(dst, NULL, context);
 
-		return false;
+			lo_close(src->connection, srcfd);
+
+			pgsql_finish(src);
+			pgsql_finish(dst);
+
+			return false;
+		}
+
+		dstfd = lo_open(dst->connection, blobOid, INV_WRITE);
+
+		if (dstfd == -1)
+		{
+			char context[BUFSIZE] = { 0 };
+
+			sformat(context, sizeof(context),
+					"Failed to open newly created large object %u", blobOid);
+
+			(void) pgcopy_log_error(dst, NULL, context);
+
+			lo_close(src->connection, srcfd);
+
+			pgsql_finish(src);
+			pgsql_finish(dst);
+
+			return false;
+		}
 	}
 
 	/*
