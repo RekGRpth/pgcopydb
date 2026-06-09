@@ -323,6 +323,8 @@ cli_create_snapshot(int argc, char **argv)
 							   createSNoptions.endpos,
 							   STREAM_MODE_CATCHUP,
 							   &(copySpecs.catalogs.source),
+							   &(copySpecs.catalogs.output),
+							   &(copySpecs.catalogs.replay),
 							   createSNoptions.stdIn,
 							   createSNoptions.stdOut,
 							   logSQL))
@@ -330,6 +332,10 @@ cli_create_snapshot(int argc, char **argv)
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
+
+		streamSpecs.maxReplayDBSize = createSNoptions.maxReplayDBSize > 0
+									  ? createSNoptions.maxReplayDBSize
+									  : (1ULL << 30);
 
 		/*
 		 * Make sure to register our setup here, as usually the command
@@ -367,6 +373,7 @@ cli_create_snapshot(int argc, char **argv)
 			PGSQL *pgsql = &(snapshot->pgsql);
 
 			(void) pgsql_finish(pgsql);
+			(void) catalog_close_from_specs(&copySpecs);
 
 			log_info("Asked to terminate, aborting");
 
