@@ -10,7 +10,9 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level \
 	 cdc-replica-identity-index cdc-partitioned-target \
 	 cdc-endpos-in-multi-wal-txn cdc-file-rotation \
-	 follow-wal2json follow-9.6 follow-data-only;
+	 cdc-pgoutput cdc-filtering-pgoutput \
+	 follow-wal2json follow-9.6 follow-data-only \
+	 follow-pgoutput;
 
 pagila: build
 	$(MAKE) -C $@
@@ -69,14 +71,35 @@ cdc-endpos-in-multi-wal-txn: build
 cdc-file-rotation: build
 	$(MAKE) -C $@
 
+cdc-pgoutput: build
+	$(MAKE) -C $@
+
+cdc-filtering-pgoutput: build
+	$(MAKE) -C $@
+
+follow-pgoutput: build
+	$(MAKE) -C $@
+
 timescaledb: build
 	$(MAKE) -C $@
 
 build:
+	@docker image inspect pagila > /dev/null 2>&1 \
+	  && echo "pagila image already present — skipping build (run 'make force-build' to rebuild)" \
+	  || docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
+
+# Force a full rebuild even when the pagila image already exists locally
+# (use after Dockerfile.pagila changes or when switching PGVERSION)
+force-build:
 	docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
 
-.PHONY: all build
+# Remove the cached pagila image so the next test starts from scratch
+clean-images:
+	-docker rmi pagila 2>/dev/null; true
+
+.PHONY: all build force-build clean-images
 .PHONY: pagila pagila-multi-steps blobs unit filtering partitioned-target extensions
 .PHONY: cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level cdc-replica-identity-index cdc-partitioned-target
 .PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation
+.PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput
 .PHONY: follow-wal2json follow-9.6
