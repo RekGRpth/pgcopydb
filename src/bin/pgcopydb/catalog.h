@@ -661,6 +661,8 @@ typedef struct ProcessInfo
 bool catalog_upsert_process_info(DatabaseCatalog *catalog, ProcessInfo *ps);
 bool catalog_delete_process(DatabaseCatalog *catalog, pid_t pid);
 bool catalog_delete_all_process_entries(DatabaseCatalog *catalog);
+bool catalog_delete_source_schema_data(DatabaseCatalog *catalog);
+bool catalog_log_command(DatabaseCatalog *catalog);
 
 bool catalog_iter_s_table_in_copy(DatabaseCatalog *catalog,
 								  void *context,
@@ -684,6 +686,17 @@ typedef struct CatalogProgressCount
 bool catalog_count_summary_done(DatabaseCatalog *catalog,
 								CatalogProgressCount *count);
 bool catalog_count_summary_done_fetch(SQLiteQuery *query);
+
+
+typedef struct CatalogBytesCounts
+{
+	uint64_t total;       /* sum of s_table.bytes (source catalog sizes) */
+	uint64_t done;        /* sum of summary.bytes for completed tables */
+	uint64_t inProgress;  /* sum of summary.bytes for in-progress tables (last flush) */
+} CatalogBytesCounts;
+
+bool catalog_count_bytes(DatabaseCatalog *catalog, CatalogBytesCounts *count);
+bool catalog_count_bytes_fetch(SQLiteQuery *query);
 
 
 /*
