@@ -99,3 +99,86 @@ pgcopydb compare data
 
 pgcopydb list extensions --source ${PGCOPYDB_SOURCE_PGURI} --dir /tmp/check/source --debug
 pgcopydb list extensions --source ${PGCOPYDB_TARGET_PGURI} --dir /tmp/check/target
+
+#
+# Test [exclude-extension] filter: copy extensions excluding intarray.
+# Source has: intarray, postgis, hstore.  Target should get: postgis, hstore.
+#
+
+psql -a ${POSTGRES_TARGET} -c "DROP DATABASE pagila WITH (FORCE)"
+psql -a ${POSTGRES_TARGET} -c "CREATE DATABASE pagila OWNER pagila"
+psql -a ${PGCOPYDB_TARGET_PGURI_SU} -c "CREATE SCHEMA foo"
+
+pgcopydb copy extensions \
+         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+         --target ${PGCOPYDB_TARGET_PGURI_SU} \
+         --filters /usr/src/pgcopydb/exclude-extension.ini \
+         --dir /tmp/pgcopydb-exclude-ext \
+         --restart --debug
+
+extcount=$(psql -At ${PGCOPYDB_TARGET_PGURI_SU} \
+    -c "SELECT count(*) FROM pg_extension WHERE extname = 'intarray'" | tr -d ' \n')
+test "${extcount}" = "0"
+
+extcount=$(psql -At ${PGCOPYDB_TARGET_PGURI_SU} \
+    -c "SELECT count(*) FROM pg_extension WHERE extname IN ('postgis', 'hstore')" | tr -d ' \n')
+test "${extcount}" = "2"
+
+#
+# Test [include-only-extension] filter: copy only hstore.
+# Source has: intarray, postgis, hstore.  Target should get: hstore only.
+#
+
+psql -a ${POSTGRES_TARGET} -c "DROP DATABASE pagila WITH (FORCE)"
+psql -a ${POSTGRES_TARGET} -c "CREATE DATABASE pagila OWNER pagila"
+psql -a ${PGCOPYDB_TARGET_PGURI_SU} -c "CREATE SCHEMA foo"
+
+pgcopydb copy extensions \
+         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+         --target ${PGCOPYDB_TARGET_PGURI_SU} \
+         --filters /usr/src/pgcopydb/include-only-extension.ini \
+         --dir /tmp/pgcopydb-include-only-ext \
+         --restart --debug
+
+extcount=$(psql -At ${PGCOPYDB_TARGET_PGURI_SU} \
+    -c "SELECT count(*) FROM pg_extension WHERE extname = 'hstore'" | tr -d ' \n')
+test "${extcount}" = "1"
+
+extcount=$(psql -At ${PGCOPYDB_TARGET_PGURI_SU} \
+    -c "SELECT count(*) FROM pg_extension WHERE extname IN ('intarray', 'postgis')" | tr -d ' \n')
+test "${extcount}" = "0"
+
+#
+# Test pgcopydb clone --requirements: verify that extensions land on the target
+# and that the version-pinning code path in copydb_prepare_extensions_restore
+# is exercised (issue #854).
+#
+# Source has intarray, postgis, hstore.  We generate the requirements from
+# the source and pass them to clone.  pg_restore skips extensions; our hook
+# creates them instead.  All three must exist on the target after clone.
+#
+
+psql -a ${POSTGRES_TARGET} -c "DROP DATABASE pagila WITH (FORCE)"
+psql -a ${POSTGRES_TARGET} -c "CREATE DATABASE pagila OWNER pagila"
+
+# collect current extension versions from the source
+pgcopydb list extensions --requirements --json \
+         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+         --dir /tmp/clone-reqs-src \
+         > /tmp/clone-requirements.json
+
+cat /tmp/clone-requirements.json
+
+# full clone with version-pinned requirements; extensions must be created by
+# copydb_prepare_extensions_restore, not by pg_restore
+pgcopydb clone \
+         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+         --target ${PGCOPYDB_TARGET_PGURI_SU} \
+         --requirements /tmp/clone-requirements.json \
+         --dir /tmp/pgcopydb-clone-reqs \
+         --restart --debug
+
+# all three source extensions must be present on the target
+extcount=$(psql -At ${PGCOPYDB_TARGET_PGURI_SU} \
+    -c "SELECT count(*) FROM pg_extension WHERE extname IN ('intarray', 'postgis', 'hstore')" | tr -d ' \n')
+test "${extcount}" = "3"

@@ -156,3 +156,104 @@ from generate_series(1, 2000) g(i);
 update xpto2 set toasted_col1 = toasted_col1, toasted_col2 = toasted_col2;
 
 commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/844
+-- Verify INSERT, UPDATE, DELETE on a table with a non-PK GENERATED ALWAYS AS
+-- IDENTITY column.  The UPDATE must not include id_col in the SET clause.
+--
+begin;
+
+insert into identity_column_test (pk_col, name) values (1, 'Alice'), (2, 'Bob');
+
+commit;
+
+begin;
+
+update identity_column_test set name = 'Alicia' where pk_col = 1;
+
+commit;
+
+begin;
+
+delete from identity_column_test where pk_col = 2;
+
+commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/968
+-- Double precision values require 17 significant digits to round-trip without
+-- loss.  The previous %f format emitted only 6 decimal places.
+--
+begin;
+
+insert into float8_precision_test(id, val) values
+(1, -216237.00000035969),
+(2,  14.949999999999999),
+(3,  1.0);
+
+commit;
+
+begin;
+
+update float8_precision_test set val = 3.141592653589793 where id = 1;
+
+commit;
+
+begin;
+
+delete from float8_precision_test where id = 2;
+
+commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/969
+-- Single-quote escaping: VARCHAR columns with embedded quotes, and values
+-- whose last character is a single-quote.
+--
+begin;
+
+insert into quote_escaping_test(id, varchar_col, text_col) values
+(1, 'It''s a varchar', 'It''s a text'),
+(2, 'trailing quote''', 'also trailing''');
+
+commit;
+
+begin;
+
+update quote_escaping_test set varchar_col = 'updated ''varchar' where id = 1;
+
+commit;
+
+begin;
+
+delete from quote_escaping_test where id = 2;
+
+commit;
+
+--
+-- No-op UPDATE tests for --replay-no-op-updates (issue #983)
+--
+begin;
+
+insert into noop_update_test (id, val) values (1, 'hello');
+
+-- This UPDATE assigns the same value that is already stored.  With REPLICA
+-- IDENTITY FULL, test_decoding emits both old-key: and new-tuple: with
+-- identical column values.  Default behaviour: the transform layer detects
+-- no change and skips the UPDATE.  With --replay-no-op-updates: replayed.
+update noop_update_test set val = 'hello' where id = 1;
+
+commit;
+
+begin;
+
+insert into all_pk_test (a, b) values (1, 2);
+
+-- Every column is part of the primary key, so test_decoding does not emit an
+-- old-key: prefix.  prepareUpdateTupleArrays finds newCount == 0 (no columns
+-- for the SET clause) and returns true without aborting.  The transform layer
+-- then skips the UPDATE because skipUpdate is true — with or without the flag.
+update all_pk_test set a = 1 where a = 1 and b = 2;
+
+commit;

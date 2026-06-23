@@ -19,6 +19,7 @@
 static bool copydb_copy_ext_table(PGSQL *src, PGSQL *dst, char *qname, char *condition);
 static bool copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname);
 static bool copydb_copy_extensions_hook(void *ctx, SourceExtension *ext);
+static bool copydb_create_extension_hook(void *ctx, SourceExtension *ext);
 
 
 /*
@@ -31,6 +32,19 @@ copydb_start_extension_data_process(CopyDataSpec *specs, bool createExtensions)
 {
 	if (specs->skipExtensions)
 	{
+		if (specs->filters.excludeExtensionList.count > 0)
+		{
+			log_warn("--skip-extensions already skips all extensions; "
+					 "[exclude-extension] filter entries are redundant");
+		}
+
+		if (specs->filters.includeOnlyExtensionList.count > 0)
+		{
+			log_error("--skip-extensions and [include-only-extension] are "
+					  "contradictory; use one or the other");
+			return false;
+		}
+
 		return true;
 	}
 
@@ -80,10 +94,12 @@ copydb_start_extension_data_process(CopyDataSpec *specs, bool createExtensions)
 typedef struct CopyExtensionsContext
 {
 	DatabaseCatalog *filtersDB;
+	DatabaseCatalog *sourceDB;
 	PGSQL *src;
 	PGSQL *dst;
 	bool createExtensions;
 	ExtensionReqs *reqs;
+	SourceFilters *filters;
 } CopyExtensionsContext;
 
 
@@ -133,10 +149,12 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 
 	CopyExtensionsContext context = {
 		.filtersDB = filtersDB,
+		.sourceDB = &(copySpecs->catalogs.source),
 		.src = &(copySpecs->sourceSnapshot.pgsql),
 		.dst = &dst,
 		.createExtensions = createExtensions,
-		.reqs = copySpecs->extRequirements
+		.reqs = copySpecs->extRequirements,
+		.filters = &(copySpecs->filters)
 	};
 
 	if (!catalog_iter_s_extension(filtersDB,
@@ -225,6 +243,66 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 	PGSQL *src = context->src;
 	PGSQL *dst = context->dst;
 
+	SourceFilters *filters = context->filters;
+
+	/* [exclude-extension]: skip explicitly excluded extensions */
+	if (filters != NULL)
+	{
+		SourceFilterExtensionList *excl = &(filters->excludeExtensionList);
+
+		for (int i = 0; i < excl->count; i++)
+		{
+			if (streq(ext->extname, excl->array[i].extname))
+			{
+				log_debug("Skipping excluded extension \"%s\"", ext->extname);
+				return true;
+			}
+		}
+	}
+
+	/* [include-only-extension]: skip extensions not in the include list */
+	if (filters != NULL)
+	{
+		SourceFilterExtensionList *incl = &(filters->includeOnlyExtensionList);
+
+		if (incl->count > 0)
+		{
+			bool found = false;
+
+			for (int i = 0; i < incl->count; i++)
+			{
+				if (streq(ext->extname, incl->array[i].extname))
+				{
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				log_debug("Skipping extension \"%s\" "
+						  "(not in include-only-extension)", ext->extname);
+				return true;
+			}
+		}
+	}
+
+	/* resume: skip this extension if it was fully copied in a previous run */
+	CopyExtensionSummary extSummary = { .extoid = ext->oid };
+
+	if (!summary_lookup_extension(context->sourceDB, &extSummary))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (extSummary.doneTime > 0)
+	{
+		log_debug("Skipping extension \"%s\": already done in a previous run",
+				  ext->extname);
+		return true;
+	}
+
 	if (context->createExtensions)
 	{
 		PQExpBuffer sql = createPQExpBuffer();
@@ -274,6 +352,18 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 
 	if (ext->config.count > 0)
 	{
+		if (!summary_add_extension(context->sourceDB, &extSummary))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!pgsql_begin(dst))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		for (int i = 0; i < ext->config.count; i++)
 		{
 			SourceExtensionConfig *config = &(ext->config.array[i]);
@@ -305,6 +395,7 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 											   config->condition))
 					{
 						/* errors have already been logged */
+						(void) pgsql_rollback(dst);
 						return false;
 					}
 
@@ -323,6 +414,7 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 												  qname))
 					{
 						/* errors have already been logged */
+						(void) pgsql_rollback(dst);
 						return false;
 					}
 
@@ -342,9 +434,40 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 							  (char) config->relkind,
 							  ext->extname,
 							  qname);
+					(void) pgsql_rollback(dst);
 					return false;
 				}
 			}
+		}
+
+		if (!pgsql_commit(dst))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!summary_finish_extension(context->sourceDB, &extSummary))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+	else
+	{
+		/*
+		 * Extension has no config tables to copy; stamp it done immediately so
+		 * a subsequent --resume skips the CREATE EXTENSION as well.
+		 */
+		if (!summary_add_extension(context->sourceDB, &extSummary))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!summary_finish_extension(context->sourceDB, &extSummary))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 	}
 
@@ -405,6 +528,148 @@ copydb_parse_extensions_requirements(CopyDataSpec *copySpecs, char *filename)
 
 	copySpecs->extRequirements = reqs;
 
+	return true;
+}
+
+
+/*
+ * copydb_create_extension_hook creates a single extension on the target,
+ * pinning its version from the requirements hash when available.  Unlike
+ * copydb_copy_extensions_hook it does not copy extension config table data;
+ * that is handled later by copydb_start_extension_data_process.
+ */
+static bool
+copydb_create_extension_hook(void *ctx, SourceExtension *ext)
+{
+	CopyExtensionsContext *context = (CopyExtensionsContext *) ctx;
+	SourceFilters *filters = context->filters;
+
+	/* [exclude-extension]: skip explicitly excluded extensions */
+	if (filters != NULL)
+	{
+		SourceFilterExtensionList *excl = &(filters->excludeExtensionList);
+
+		for (int i = 0; i < excl->count; i++)
+		{
+			if (streq(ext->extname, excl->array[i].extname))
+			{
+				log_debug("Skipping excluded extension \"%s\"", ext->extname);
+				return true;
+			}
+		}
+	}
+
+	/* [include-only-extension]: skip extensions not in the include list */
+	if (filters != NULL)
+	{
+		SourceFilterExtensionList *incl = &(filters->includeOnlyExtensionList);
+
+		if (incl->count > 0)
+		{
+			bool found = false;
+
+			for (int i = 0; i < incl->count; i++)
+			{
+				if (streq(ext->extname, incl->array[i].extname))
+				{
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				log_debug("Skipping extension \"%s\" "
+						  "(not in include-only-extension)", ext->extname);
+				return true;
+			}
+		}
+	}
+
+	ExtensionReqs *req = NULL;
+	HASH_FIND(hh, context->reqs, ext->extname, strlen(ext->extname), req);
+
+	PQExpBuffer sql = createPQExpBuffer();
+
+	appendPQExpBuffer(sql,
+					  "create extension if not exists \"%s\" "
+					  "with schema \"%s\" cascade",
+					  ext->extname, ext->extnamespace);
+
+	if (req != NULL)
+	{
+		appendPQExpBuffer(sql, " version \"%s\"", req->version);
+		log_notice("Pinning extension \"%s\" to version \"%s\"",
+				   ext->extname, req->version);
+	}
+
+	if (PQExpBufferBroken(sql))
+	{
+		log_error("Failed to build CREATE EXTENSION sql buffer: "
+				  "Out of Memory");
+		(void) destroyPQExpBuffer(sql);
+		return false;
+	}
+
+	log_info("Creating extension \"%s\"", ext->extname);
+
+	if (!pgsql_execute(context->dst, sql->data))
+	{
+		log_error("Failed to create extension \"%s\"", ext->extname);
+		(void) destroyPQExpBuffer(sql);
+		return false;
+	}
+
+	(void) destroyPQExpBuffer(sql);
+	return true;
+}
+
+
+/*
+ * copydb_create_pinned_extensions creates all extensions found in the source
+ * catalog on the target, pinning each to the version recorded in
+ * copySpecs->extRequirements.  Extensions not listed in the requirements file
+ * are created without a VERSION clause (latest available).
+ *
+ * This must be called BEFORE pg_restore --section=pre-data so that schema
+ * objects that depend on extension types (e.g. PostGIS geometry columns) are
+ * available when pg_restore processes CREATE TABLE statements.
+ */
+bool
+copydb_create_pinned_extensions(CopyDataSpec *copySpecs)
+{
+	if (copySpecs->extRequirements == NULL || copySpecs->skipExtensions)
+	{
+		return true;
+	}
+
+	DatabaseCatalog *filterDB = &(copySpecs->catalogs.filter);
+	PGSQL dst = { 0 };
+
+	if (!pgsql_init(&dst, copySpecs->connStrings.target_pguri, PGSQL_CONN_TARGET))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	CopyExtensionsContext context = {
+		.filtersDB = filterDB,
+		.dst = &dst,
+		.reqs = copySpecs->extRequirements,
+		.filters = &(copySpecs->filters),
+	};
+
+	if (!catalog_iter_s_extension(filterDB,
+								  &context,
+								  &copydb_create_extension_hook))
+	{
+		log_error("Failed to create extensions with version pinning, "
+				  "see above for details");
+		(void) pgsql_finish(&dst);
+		return false;
+	}
+
+	(void) pgsql_finish(&dst);
 	return true;
 }
 

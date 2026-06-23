@@ -107,7 +107,7 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 		return false;
 	}
 
-	log_info("Using work dir \"%s\"", cfPaths->topdir);
+	log_debug("Using work dir \"%s\"", cfPaths->topdir);
 
 	/*
 	 * Some inspection commands piggy-back on the work directory that has been
@@ -429,6 +429,9 @@ copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths)
 	sformat(dumpPaths->preListFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "pre-filtered.list");
 
+	sformat(dumpPaths->schemaListFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "schemas-only.list");
+
 	sformat(dumpPaths->postListOutFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "post-out.list");
 
@@ -535,6 +538,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.splitMaxParts = options->splitMaxParts,
 		.estimateTableSizes = options->estimateTableSizes,
 
+		.preDataQueue = { NULL, -1 },
 		.vacuumQueue = { NULL, -1 },
 		.indexQueue = { NULL, -1 },
 
@@ -633,6 +637,7 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 
 		.section = specs->section,
 		.resume = specs->resume,
+		.allDatabases = specs->allDatabases,
 
 		.sourceTable = source,
 		.summary = { 0 },
@@ -684,7 +689,7 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
  * until all the known subprocess are finished, then returns true.
  */
 bool
-copydb_fatal_exit()
+copydb_fatal_exit(void)
 {
 	log_fatal("Terminating all processes in our process group");
 

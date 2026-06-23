@@ -21,7 +21,7 @@
  * vacuum_start_supervisor starts a VACUUM supervisor process.
  */
 bool
-vacuum_start_supervisor(CopyDataSpec *specs)
+vacuum_start_supervisor(CopyDataSpec *specs, pid_t *pidOut)
 {
 	/*
 	 * Flush stdio channels just before fork, to avoid double-output problems.
@@ -57,6 +57,10 @@ vacuum_start_supervisor(CopyDataSpec *specs)
 		default:
 		{
 			/* fork succeeded, in parent */
+			if (pidOut != NULL)
+			{
+				*pidOut = fpid;
+			}
 			break;
 		}
 	}
@@ -94,9 +98,28 @@ vacuum_supervisor(CopyDataSpec *specs)
 		return false;
 	}
 
+	/*
+	 * Close the catalog before forking so that each vacuum worker opens its
+	 * own SQLite connection.  Inheriting a forked sqlite3* handle causes WAL
+	 * write-lock conflicts between sibling workers even when the SysV
+	 * semaphore is held (issue #881).
+	 */
+	if (!catalog_close(sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (!vacuum_start_workers(specs))
 	{
 		log_error("Failed to start vacuum workers, see above for details");
+		return false;
+	}
+
+	/* reopen in the supervisor process after the fork */
+	if (!catalog_open(sourceDB))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -206,6 +229,22 @@ vacuum_worker(CopyDataSpec *specs)
 		return false;
 	}
 
+	/*
+	 * For --all-databases: maintain a lightweight pool keyed by datname.
+	 * Each entry holds a per-db CopyDataSpec (catalog + target URI) without
+	 * a source snapshot connection.
+	 */
+	MultiDbContext vacCtx = { 0 };
+
+	if (specs->allDatabases)
+	{
+		if (!multidb_context_init(&vacCtx, specs))
+		{
+			log_error("Failed to initialise vacuum multi-database context");
+			return false;
+		}
+	}
+
 	int errors = 0;
 	bool stop = false;
 
@@ -217,12 +256,14 @@ vacuum_worker(CopyDataSpec *specs)
 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
 			log_error("VACUUM worker has been interrupted");
+			(void) multidb_index_context_close_all(&vacCtx);
 			return false;
 		}
 
 		if (!recv_ok)
 		{
 			/* errors have already been logged */
+			(void) multidb_index_context_close_all(&vacCtx);
 			return false;
 		}
 
@@ -237,16 +278,44 @@ vacuum_worker(CopyDataSpec *specs)
 
 			case QMSG_TYPE_TABLEOID:
 			{
-				if (!vacuum_analyze_table_by_oid(specs, mesg.data.oid))
+				uint32_t oid = mesg.data.tp.oid;
+				CopyDataSpec *useSpecs = specs;
+
+				if (specs->allDatabases)
+				{
+					const char *datname = mesg.data.tp.datname;
+					MultiDbEntry *entry =
+						multidb_index_context_get_entry(&vacCtx, datname);
+
+					if (entry == NULL)
+					{
+						log_error("Failed to get context for database \"%s\", "
+								  "skipping VACUUM of table oid %u",
+								  datname, oid);
+						++errors;
+
+						if (specs->failFast)
+						{
+							(void) multidb_index_context_close_all(&vacCtx);
+							return false;
+						}
+						break;
+					}
+
+					useSpecs = entry->dbSpecs;
+				}
+
+				if (!vacuum_analyze_table_by_oid(useSpecs, oid))
 				{
 					++errors;
 
 					log_error("Failed to vacuum table with oid %u, "
 							  "see above for details",
-							  mesg.data.oid);
+							  oid);
 
 					if (specs->failFast)
 					{
+						(void) multidb_index_context_close_all(&vacCtx);
 						return false;
 					}
 				}
@@ -262,6 +331,8 @@ vacuum_worker(CopyDataSpec *specs)
 			}
 		}
 	}
+
+	(void) multidb_index_context_close_all(&vacCtx);
 
 	if (!catalog_delete_process(&(specs->catalogs.source), pid))
 	{
@@ -340,7 +411,14 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 	sformat(psTitle, sizeof(psTitle), "pgcopydb: %s", vacuum);
 	(void) set_ps_title(psTitle);
 
-	log_notice("%s;", vacuum);
+	if (specs->datname[0] != '\0')
+	{
+		log_notice("%s: %s;", specs->datname, vacuum);
+	}
+	else
+	{
+		log_notice("%s;", vacuum);
+	}
 
 	/* also track the process information in our catalogs */
 	ProcessInfo ps = {
@@ -396,14 +474,18 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
  * given table.
  */
 bool
-vacuum_add_table(CopyDataSpec *specs, uint32_t oid)
+vacuum_add_table(CopyDataSpec *specs, uint32_t oid, const char *datname)
 {
 	QMessage mesg = {
 		.type = QMSG_TYPE_TABLEOID,
-		.data.oid = oid
+		.data.tp.oid = oid,
 	};
 
-	log_debug("vacuum_add_table: %u", oid);
+	strlcpy(mesg.data.tp.datname,
+			datname != NULL ? datname : "",
+			sizeof(mesg.data.tp.datname));
+
+	log_debug("vacuum_add_table: %u \"%s\"", oid, mesg.data.tp.datname);
 
 	if (!queue_send(&(specs->vacuumQueue), &mesg))
 	{

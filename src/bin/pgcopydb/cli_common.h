@@ -70,6 +70,7 @@ typedef struct CopyDBOptions
 	bool skipDBproperties;
 	bool skipCtidSplit;
 	bool noRolesPasswords;
+	bool replayNoOpUpdates;
 	bool failFast;
 	bool useCopyBinary;
 
@@ -109,6 +110,8 @@ typedef struct CopyDBOptions
 	 */
 	char host[256];
 	int port;
+
+	bool allDatabases;
 } CopyDBOptions;
 
 extern bool outputJSON;

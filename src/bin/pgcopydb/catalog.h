@@ -11,6 +11,18 @@
 #include "string_utils.h"
 
 /*
+ * Column counts for batch INSERT SQL generation.  These must match the
+ * parameter lists in catalog_add_s_*() exactly so that the batch functions
+ * compute correct ?NNN parameter numbers and stay within SQLite's
+ * SQLITE_LIMIT_VARIABLE_NUMBER limit.
+ */
+#define CATALOG_INSERT_NCOLS_S_TABLE 11
+#define CATALOG_INSERT_NCOLS_S_ATTR 10
+#define CATALOG_INSERT_NCOLS_S_INDEX 10
+#define CATALOG_INSERT_NCOLS_S_CONSTRAINT 6
+#define CATALOG_INSERT_NCOLS_S_SEQ 9
+
+/*
  * Internal infrastructure to bind values to SQLite prepared statements.
  */
 typedef struct SQLiteQuery SQLiteQuery;
@@ -23,6 +35,7 @@ struct SQLiteQuery
 	const char *sql;
 
 	bool errorOnZeroRows;
+	bool fromCache;             /* true when ppStmt is owned by the stmtCache */
 
 	CatalogFetchResult *fetchFunction;
 	void *context;
@@ -33,12 +46,14 @@ struct SQLiteQuery
  * Catalog API.
  */
 bool catalog_open(DatabaseCatalog *catalog);
+bool catalog_open_readonly(DatabaseCatalog *catalog);
 bool catalog_init(DatabaseCatalog *catalog);
 bool catalog_create_semaphore(DatabaseCatalog *catalog);
 bool catalog_attach(DatabaseCatalog *a, DatabaseCatalog *b, const char *name);
 bool catalog_close(DatabaseCatalog *catalog);
 
 bool catalog_create_schema(DatabaseCatalog *catalog);
+bool catalog_create_indexes(DatabaseCatalog *catalog);
 bool catalog_drop_schema(DatabaseCatalog *catalog);
 
 bool catalog_set_wal_mode(DatabaseCatalog *catalog);
@@ -191,6 +206,12 @@ typedef struct CatalogMatView
 
 bool catalog_add_s_matview(DatabaseCatalog *catalog, SourceTable *table);
 
+bool catalog_upsert_target_s_rel(DatabaseCatalog *catalog,
+								 const char *nspname,
+								 const char *relname,
+								 char relkind,
+								 bool ispopulated);
+
 bool catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
 									 CatalogMatView *result,
 									 uint32_t oid);
@@ -200,7 +221,9 @@ bool catalog_s_matview_fetch(SQLiteQuery *query);
  * Tables and their attributes and parts (COPY partitioning).
  */
 bool catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table);
-bool catalog_add_attributes(DatabaseCatalog *catalog, SourceTable *table);
+bool catalog_add_s_table_batch(DatabaseCatalog *catalog,
+							   SourceTable *tables,
+							   int count);
 bool catalog_add_s_table_part(DatabaseCatalog *catalog, SourceTable *table);
 
 bool catalog_add_s_table_chksum(DatabaseCatalog *catalog,
@@ -279,6 +302,9 @@ bool catalog_iter_s_table_part_next(SourceTablePartsIterator *iter);
 bool catalog_iter_s_table_part_finish(SourceTablePartsIterator *iter);
 
 bool catalog_s_table_attrlist(DatabaseCatalog *catalog, SourceTable *table);
+bool catalog_s_table_all_binary_compatible(DatabaseCatalog *catalog,
+										   SourceTable *table,
+										   bool *allCompatible);
 bool catalog_s_table_part_fetch(SQLiteQuery *query);
 
 bool catalog_s_table_fetch_attrlist(SQLiteQuery *query);
@@ -300,6 +326,17 @@ bool catalog_iter_s_table_attrs_finish(SourceTableAttrsIterator *iter);
 
 bool catalog_s_table_attrs_fetch(SQLiteQuery *query);
 
+bool catalog_add_s_attr(DatabaseCatalog *catalog,
+						uint32_t tableoid,
+						SourceTableAttribute *attr);
+bool catalog_add_s_attr_batch(DatabaseCatalog *catalog,
+							  uint32_t *tableoids,
+							  SourceTableAttribute *attrs,
+							  int count);
+bool catalog_s_table_oid_array(DatabaseCatalog *catalog,
+							   char **text,
+							   int *count);
+
 bool catalog_lookup_s_attr_by_name(DatabaseCatalog *catalog,
 								   uint32_t reloid,
 								   const char *attname,
@@ -311,7 +348,13 @@ bool catalog_s_attr_fetch(SQLiteQuery *query);
  * Indexes
  */
 bool catalog_add_s_index(DatabaseCatalog *catalog, SourceIndex *index);
+bool catalog_add_s_index_batch(DatabaseCatalog *catalog,
+							   SourceIndex *indexes,
+							   int count);
 bool catalog_add_s_constraint(DatabaseCatalog *catalog, SourceIndex *index);
+bool catalog_add_s_constraint_batch(DatabaseCatalog *catalog,
+									SourceIndex *indexes,
+									int count);
 
 bool catalog_lookup_s_index(DatabaseCatalog *catalog,
 							uint32_t oid,
@@ -392,16 +435,26 @@ bool catalog_iter_s_seq_finish(SourceSeqIterator *iter);
 bool catalog_s_seq_fetch(SQLiteQuery *query);
 
 /*
- * Filtering is done through a single table that concatenates the Oid and
- * pg_restore archives TOC list names (restore_list_name) in such a way that we
- * can get away with a single hash-table like lookup.
+ * Filtering is done through a single table keyed by (catoid, oid) — the same
+ * object identity scheme PostgreSQL uses in pg_depend (classid + objid).
+ * catoid is the OID of the system catalog table that owns the object, fetched
+ * at runtime via catalog_fetch_catnames().
  */
+bool catalog_fetch_catnames(DatabaseCatalog *filterDB, PGSQL *pgsql);
+bool catalog_add_catname(DatabaseCatalog *catalog, uint32_t oid,
+						 const char *catname);
+
+bool catalog_add_extension_filter(DatabaseCatalog *catalog,
+								  const char *extname,
+								  const char *action);
+
 bool catalog_prepare_filter(DatabaseCatalog *catalog,
 							bool skipExtensions,
 							bool skipCollations);
 
 typedef struct CatalogFilter
 {
+	uint32_t catoid;
 	uint32_t oid;
 	char restoreListName[RESTORE_LIST_NAMEDATALEN];
 	char kind[PG_NAMEDATALEN];
@@ -409,7 +462,12 @@ typedef struct CatalogFilter
 
 bool catalog_lookup_filter_by_oid(DatabaseCatalog *catalog,
 								  CatalogFilter *result,
-								  uint32_t oid);
+								  uint32_t catalogOid,
+								  uint32_t objectOid);
+
+bool catalog_lookup_filter_by_oid_only(DatabaseCatalog *catalog,
+									   CatalogFilter *result,
+									   uint32_t objectOid);
 
 bool catalog_lookup_filter_by_rlname(DatabaseCatalog *catalog,
 									 CatalogFilter *result,
@@ -443,6 +501,10 @@ bool catalog_iter_s_database_next(SourceDatabaseIterator *iter);
 bool catalog_iter_s_database_finish(SourceDatabaseIterator *iter);
 
 bool catalog_s_database_fetch(SQLiteQuery *query);
+
+bool catalog_update_s_database_snapshot(DatabaseCatalog *catalog,
+										const char *datname,
+										const char *snapshot);
 
 typedef bool (SourcePropertyIterFun)(void *context, SourceProperty *property);
 
@@ -598,6 +660,7 @@ typedef struct ProcessInfo
 
 bool catalog_upsert_process_info(DatabaseCatalog *catalog, ProcessInfo *ps);
 bool catalog_delete_process(DatabaseCatalog *catalog, pid_t pid);
+bool catalog_delete_all_process_entries(DatabaseCatalog *catalog);
 
 bool catalog_iter_s_table_in_copy(DatabaseCatalog *catalog,
 								  void *context,
@@ -658,6 +721,10 @@ typedef struct BindParam
 bool catalog_execute(DatabaseCatalog *catalog, char *sql);
 
 bool catalog_sql_prepare(sqlite3 *db, const char *sql, SQLiteQuery *query);
+bool catalog_sql_prepare_cached(DatabaseCatalog *catalog,
+								const char *sql,
+								SQLiteQuery *query);
+bool catalog_close_stmts(DatabaseCatalog *catalog);
 bool catalog_sql_bind(SQLiteQuery *query, BindParam *params, int count);
 bool catalog_sql_execute(SQLiteQuery *query);
 bool catalog_sql_execute_once(SQLiteQuery *query);

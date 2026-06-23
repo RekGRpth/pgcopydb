@@ -22,12 +22,15 @@ typedef enum
 	SOURCE_FILTER_EXCLUDE_TABLE,
 	SOURCE_FILTER_EXCLUDE_TABLE_DATA,
 	SOURCE_FILTER_EXCLUDE_INDEX,
-	SOURCE_FILTER_INCLUDE_ONLY_TABLE
+	SOURCE_FILTER_INCLUDE_ONLY_TABLE,
+	SOURCE_FILTER_EXCLUDE_EXTENSION,
+	SOURCE_FILTER_INCLUDE_ONLY_EXTENSION
 } SourceFilterSection;
 
 typedef struct SourceFilterSchema
 {
-	char nspname[PG_NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];        /* bare name from pg_namespace (after normalization) */
+	char restoreListName[PG_NAMEDATALEN]; /* quote_ident form for pg_dump/pg_restore args */
 } SourceFilterSchema;
 
 typedef struct SourceFilterSchemaList
@@ -48,6 +51,18 @@ typedef struct SourceFilterTableList
 	int count;
 	SourceFilterTable *array;   /* malloc'ed area */
 } SourceFilterTableList;
+
+
+typedef struct SourceFilterExtension
+{
+	char extname[PG_NAMEDATALEN];
+} SourceFilterExtension;
+
+typedef struct SourceFilterExtensionList
+{
+	int count;
+	SourceFilterExtension *array;   /* malloc'ed area */
+} SourceFilterExtensionList;
 
 
 /*
@@ -86,6 +101,7 @@ typedef enum
 typedef struct SourceFilters
 {
 	bool prepared;
+	bool normalized;
 	SourceFilterType type;
 	SourceFilterSchemaList includeOnlySchemaList;
 	SourceFilterSchemaList excludeSchemaList;
@@ -93,11 +109,14 @@ typedef struct SourceFilters
 	SourceFilterTableList excludeTableList;
 	SourceFilterTableList excludeTableDataList;
 	SourceFilterTableList excludeIndexList;
+	SourceFilterExtensionList excludeExtensionList;
+	SourceFilterExtensionList includeOnlyExtensionList;
 } SourceFilters;
 
 char * filterTypeToString(SourceFilterType type);
 SourceFilterType filterTypeComplement(SourceFilterType type);
 bool parse_filters(const char *filebname, SourceFilters *filters);
+bool filters_validate_and_normalize(PGSQL *pgsql, SourceFilters *filters);
 
 bool filters_as_json(SourceFilters *filters, JSON_Value *jsFilter);
 

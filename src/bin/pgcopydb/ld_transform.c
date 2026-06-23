@@ -55,8 +55,6 @@ static bool prepareGeneratedColumnsCache_hook(void *ctx, SourceTable *table);
 
 static bool prepareGeneratedColumnsCache(StreamSpecs *specs);
 
-static bool isGeneratedColumn(GeneratedColumnSet *columns, const char *attname);
-
 static GeneratedColumnSet * lookupGeneratedColumnsForTable(GeneratedColumnsCache *cache,
 														   const char *nspname,
 														   const char *relname);
@@ -71,7 +69,8 @@ static bool stream_transform_prepare_message(StreamSpecs *specs,
 static bool stream_write_insert(ReplayDBStmt *replayStmt,
 								LogicalMessageInsert *insert);
 
-static bool stream_write_update(ReplayDBStmt *replayStmt,
+static bool stream_write_update(bool replayNoOpUpdates,
+								ReplayDBStmt *replayStmt,
 								LogicalMessageUpdate *update);
 
 static bool stream_write_delete(ReplayDBStmt *replayStmt,
@@ -80,11 +79,14 @@ static bool stream_write_delete(ReplayDBStmt *replayStmt,
 static bool stream_write_truncate(ReplayDBStmt *replayStmt,
 								  LogicalMessageTruncate *truncate);
 
-static bool stream_write_file_txn(FILE *out, LogicalTransaction *txn);
+static bool stream_write_file_txn(FILE *out,
+								  LogicalTransaction *txn,
+								  bool replayNoOpUpdates);
 
 static bool stream_write_file_message(FILE *out,
 									  LogicalMessage *msg,
-									  LogicalMessageMetadata *metadata);
+									  LogicalMessageMetadata *metadata,
+									  bool replayNoOpUpdates);
 
 
 /*
@@ -454,7 +456,7 @@ stream_transform_write_transaction(StreamSpecs *specs)
  * SQLite pipeline refactoring removed stream_write_message().
  */
 static bool
-stream_write_file_txn(FILE *out, LogicalTransaction *txn)
+stream_write_file_txn(FILE *out, LogicalTransaction *txn, bool replayNoOpUpdates)
 {
 #define FFORMAT(stream, fmt, ...) \
 	{ if (fformat(stream, fmt, __VA_ARGS__) == -1) { \
@@ -530,7 +532,8 @@ stream_write_file_txn(FILE *out, LogicalTransaction *txn)
 
 			case STREAM_ACTION_UPDATE:
 			{
-				if (!stream_write_update(&replayStmt,
+				if (!stream_write_update(replayNoOpUpdates,
+										 &replayStmt,
 										 &(currentStmt->stmt.update)))
 				{
 					/* errors have already been logged */
@@ -627,7 +630,8 @@ stream_write_file_txn(FILE *out, LogicalTransaction *txn)
 static bool
 stream_write_file_message(FILE *out,
 						  LogicalMessage *msg,
-						  LogicalMessageMetadata *metadata)
+						  LogicalMessageMetadata *metadata,
+						  bool replayNoOpUpdates)
 {
 #define FFORMAT(stream, fmt, ...) \
 	{ if (fformat(stream, fmt, __VA_ARGS__) == -1) { \
@@ -637,7 +641,7 @@ stream_write_file_message(FILE *out,
 
 	if (msg->isTransaction)
 	{
-		return stream_write_file_txn(out, &(msg->command.tx));
+		return stream_write_file_txn(out, &(msg->command.tx), replayNoOpUpdates);
 	}
 
 	/* non-transaction messages: SWITCH / KEEPALIVE / ENDPOS */
@@ -743,8 +747,11 @@ stream_transform_write_message(StreamContext *privateContext,
 	 */
 	if (privateContext->sqlFile != NULL)
 	{
+		bool replayNoOpUpdates = privateContext->specs != NULL &&
+								 privateContext->specs->replayNoOpUpdates;
+
 		if (!stream_write_file_message(privateContext->sqlFile, currentMsg,
-									   metadata))
+									   metadata, replayNoOpUpdates))
 		{
 			/* errors have already been logged */
 			return false;
@@ -1772,6 +1779,17 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 		return false;
 	}
 
+	GeneratedColumnsCache *cache = privateContext->generatedColumnsCache;
+
+	if (cache != NULL)
+	{
+		if (!markGeneratedColumnsFromTransaction(cache, txn))
+		{
+			log_error("Failed to mark generated columns from transaction");
+			return false;
+		}
+	}
+
 	LogicalTransactionStatement *currentStmt = txn->first;
 
 	for (; currentStmt != NULL; currentStmt = currentStmt->next)
@@ -1799,7 +1817,8 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 
 			case STREAM_ACTION_UPDATE:
 			{
-				if (!stream_write_update(&stmt, &(currentStmt->stmt.update)))
+				if (!stream_write_update(specs->replayNoOpUpdates,
+										 &stmt, &(currentStmt->stmt.update)))
 				{
 					/* errors have already been logged */
 					return false;
@@ -1866,6 +1885,9 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 static bool
 stream_write_insert(ReplayDBStmt *replayStmt, LogicalMessageInsert *insert)
 {
+	strlcpy(replayStmt->nspname, insert->table.nspname, sizeof(replayStmt->nspname));
+	strlcpy(replayStmt->relname, insert->table.relname, sizeof(replayStmt->relname));
+
 	/* loop over INSERT statements targeting the same table */
 	for (int s = 0; s < insert->new.count; s++)
 	{
@@ -1984,8 +2006,13 @@ stream_write_insert(ReplayDBStmt *replayStmt, LogicalMessageInsert *insert)
  * stream_write_update writes an UPDATE statement.
  */
 static bool
-stream_write_update(ReplayDBStmt *replayStmt, LogicalMessageUpdate *update)
+stream_write_update(bool replayNoOpUpdates,
+					ReplayDBStmt *replayStmt,
+					LogicalMessageUpdate *update)
 {
+	strlcpy(replayStmt->nspname, update->table.nspname, sizeof(replayStmt->nspname));
+	strlcpy(replayStmt->relname, update->table.relname, sizeof(replayStmt->relname));
+
 	if (update->old.count != update->new.count)
 	{
 		log_error("Failed to write UPDATE statement "
@@ -2071,7 +2098,8 @@ stream_write_update(ReplayDBStmt *replayStmt, LogicalMessageUpdate *update)
 						LogicalMessageValue *oldValue =
 							&(old->values.array[0].array[oc]);
 
-						if (LogicalMessageValueEq(oldValue, value))
+						if (!replayNoOpUpdates &&
+							LogicalMessageValueEq(oldValue, value))
 						{
 							skip = true;
 							break;
@@ -2079,8 +2107,22 @@ stream_write_update(ReplayDBStmt *replayStmt, LogicalMessageUpdate *update)
 					}
 				}
 
-				if (skip)
+				if (skip || attr->isidentityalways)
 				{
+					/*
+					 * Skip this column from the SET clause.
+					 *
+					 * For value-unchanged columns (skip=true): the old and new
+					 * values are equal, so setting it is a no-op.
+					 *
+					 * For GENERATED ALWAYS AS IDENTITY columns: PostgreSQL
+					 * rejects "SET col = $N" with "can only be updated to
+					 * DEFAULT".  Unlike INSERT (where OVERRIDING SYSTEM VALUE
+					 * lets us supply the value), there is no equivalent for
+					 * UPDATE, so we must omit these columns from the SET clause.
+					 * The identity value is stable across normal UPDATEs, so
+					 * omitting it is correct.
+					 */
 					++skipColumnCount;
 				}
 				else
@@ -2188,8 +2230,8 @@ stream_write_update(ReplayDBStmt *replayStmt, LogicalMessageUpdate *update)
 
 		if (skipUpdate)
 		{
-			log_warn("Skipping UPDATE statement as all columns are "
-					 "the same as the old");
+			log_debug("Skipping no-op UPDATE statement: "
+					  "all column values are unchanged");
 
 			destroyPQExpBuffer(buf);
 			return true;
@@ -2217,6 +2259,9 @@ stream_write_update(ReplayDBStmt *replayStmt, LogicalMessageUpdate *update)
 static bool
 stream_write_delete(ReplayDBStmt *replayStmt, LogicalMessageDelete *delete)
 {
+	strlcpy(replayStmt->nspname, delete->table.nspname, sizeof(replayStmt->nspname));
+	strlcpy(replayStmt->relname, delete->table.relname, sizeof(replayStmt->relname));
+
 	/* loop over DELETE statements targeting the same table */
 	for (int s = 0; s < delete->old.count; s++)
 	{
@@ -2318,6 +2363,9 @@ stream_write_delete(ReplayDBStmt *replayStmt, LogicalMessageDelete *delete)
 static bool
 stream_write_truncate(ReplayDBStmt *replayStmt, LogicalMessageTruncate *truncate)
 {
+	strlcpy(replayStmt->nspname, truncate->table.nspname, sizeof(replayStmt->nspname));
+	strlcpy(replayStmt->relname, truncate->table.relname, sizeof(replayStmt->relname));
+
 	PQExpBuffer buf = createPQExpBuffer();
 
 	printfPQExpBuffer(buf, "TRUNCATE ONLY %s.%s\n",
@@ -2393,7 +2441,27 @@ stream_add_value_in_json_array(LogicalMessageValue *value, JSON_Array *jsArray)
 				}
 				else
 				{
-					sformat(string, sizeof(string), "%f", value->val.float8);
+					/*
+					 * IEEE 754 double precision requires 17 significant decimal
+					 * digits to round-trip without loss.  The previous "%f"
+					 * format produced only 6 decimal places, silently corrupting
+					 * values like -216237.00000035969.  Trailing zeros are
+					 * stripped so that the serialised form stays compact and
+					 * matches what wal2json / Postgres itself would emit.
+					 */
+					sformat(string, sizeof(string), "%.17f", value->val.float8);
+
+					char *p = string + strlen(string) - 1;
+
+					while (p > string && *p == '0')
+					{
+						*p-- = '\0';
+					}
+
+					if (*p == '.')
+					{
+						*p = '\0';
+					}
 				}
 
 				json_array_append_string(jsArray, string);
@@ -2563,36 +2631,6 @@ lookupGeneratedColumnsForTable(GeneratedColumnsCache *cache,
 
 
 /*
- * isGeneratedColumn checks whether the given "attname" is a generated column.
- *
- * Returns true if the column is generated, false otherwise.
- *
- * NOTE: There is no error condition, if the columns is NULL, it means that we
- * don't have any generated columns in the catalog.
- */
-static bool
-isGeneratedColumn(GeneratedColumnSet *columns, const char *attname)
-{
-	char attnameNormalized[PG_NAMEDATALEN] = { 0 };
-
-	NORMALIZED_PG_NAMEDATA_COPY(attnameNormalized, attname);
-
-	GeneratedColumnSet *generatedColumns = NULL;
-
-	HASH_FIND_STR(columns, attnameNormalized, generatedColumns);
-
-	if (generatedColumns != NULL)
-	{
-		log_trace("Column \"%s\" is generated", attnameNormalized);
-
-		return true;
-	}
-
-	return false;
-}
-
-
-/*
  * prepareGeneratedColumnsCache_hook is a callback function that populates the
  * generated columns cache from the catalog.
  */
@@ -2623,9 +2661,9 @@ prepareGeneratedColumnsCache_hook(void *ctx, SourceTable *table)
 	{
 		SourceTableAttribute *attr = &(table->attributes.array[i]);
 
-		if (attr->attisgenerated)
+		if (attr->attisgenerated || attr->attidentity == 'a')
 		{
-			/* Add a generated column to the GeneratedColumnSet */
+			/* Add a generated or identity-always column to the set */
 			GeneratedColumnSet *generatedColumn = (GeneratedColumnSet *)
 												  calloc(1, sizeof(GeneratedColumnSet));
 			if (generatedColumn == NULL)
@@ -2635,10 +2673,10 @@ prepareGeneratedColumnsCache_hook(void *ctx, SourceTable *table)
 			}
 
 			NORMALIZED_PG_NAMEDATA_COPY(generatedColumn->attname, attr->attname);
+			generatedColumn->isidentityalways = (attr->attidentity == 'a');
 			HASH_ADD_STR(item->columns, attname, generatedColumn);
 		}
 	}
-
 
 	NORMALIZED_PG_NAMEDATA_COPY(item->nspname, table->nspname);
 	NORMALIZED_PG_NAMEDATA_COPY(item->relname, table->relname);
@@ -2740,12 +2778,12 @@ markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
 		return true;
 	}
 
-	GeneratedColumnSet *generatedColumns = lookupGeneratedColumnsForTable(cache, nspname,
-																		  relname);
+	GeneratedColumnSet *tableColumns = lookupGeneratedColumnsForTable(cache, nspname,
+																	  relname);
 
-	if (generatedColumns == NULL)
+	if (tableColumns == NULL)
 	{
-		/* no generated columns in this table */
+		/* no generated or identity columns in this table */
 		return true;
 	}
 
@@ -2757,9 +2795,16 @@ markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
 		{
 			LogicalMessageAttribute *attr = &(tuple->attributes.array[c]);
 
-			if (isGeneratedColumn(generatedColumns, attr->attname))
+			char attnameNormalized[PG_NAMEDATALEN] = { 0 };
+			NORMALIZED_PG_NAMEDATA_COPY(attnameNormalized, attr->attname);
+
+			GeneratedColumnSet *entry = NULL;
+			HASH_FIND_STR(tableColumns, attnameNormalized, entry);
+
+			if (entry != NULL)
 			{
-				attr->isgenerated = true;
+				attr->isidentityalways = entry->isidentityalways;
+				attr->isgenerated = !entry->isidentityalways;
 			}
 		}
 	}

@@ -55,13 +55,17 @@ stream_init_specs(StreamSpecs *specs,
 				  DatabaseCatalog *replayDB,
 				  bool stdin,
 				  bool stdout,
-				  bool logSQL)
+				  bool logSQL,
+				  bool replayNoOpUpdates,
+				  SourceFilters *filters,
+				  DatabaseCatalog *targetDB)
 {
 	/* just copy into StreamSpecs what's been initialized in copySpecs */
 	specs->mode = mode;
 	specs->stdIn = stdin;
 	specs->stdOut = stdout;
 	specs->logSQL = logSQL;
+	specs->replayNoOpUpdates = replayNoOpUpdates;
 
 	/*
 	 * Initialize pipe fds to -1 so that callers can safely test
@@ -82,6 +86,7 @@ stream_init_specs(StreamSpecs *specs,
 	specs->sourceDB = sourceDB;
 	specs->outputDB = outputDB;
 	specs->replayDB = replayDB;
+	specs->targetDB = targetDB;
 
 	if (!catalog_init(specs->sourceDB))
 	{
@@ -140,6 +145,82 @@ stream_init_specs(StreamSpecs *specs,
 			};
 
 			specs->pluginOptions = options;
+
+			/*
+			 * Build wal2json filter-tables value from user-specified filters.
+			 * pgcopydb.* is always excluded; user exclusions are appended.
+			 * For include-only filters we also add an add-tables option so
+			 * wal2json only emits changes for the specified tables/schemas.
+			 */
+			strlcpy(specs->wal2jsonFilterTables,
+					"pgcopydb.*",
+					sizeof(specs->wal2jsonFilterTables));
+
+			if (filters != NULL)
+			{
+				if (filters->type == SOURCE_FILTER_TYPE_EXCL ||
+					filters->type == SOURCE_FILTER_TYPE_LIST_EXCL ||
+					filters->type == SOURCE_FILTER_TYPE_LIST_NOT_INCL)
+				{
+					for (int i = 0; i < filters->excludeSchemaList.count; i++)
+					{
+						char entry[BUFSIZE] = { 0 };
+						sformat(entry, sizeof(entry), ",%s.*",
+								filters->excludeSchemaList.array[i].nspname);
+						strlcat(specs->wal2jsonFilterTables, entry,
+								sizeof(specs->wal2jsonFilterTables));
+					}
+
+					for (int i = 0; i < filters->excludeTableList.count; i++)
+					{
+						char entry[BUFSIZE] = { 0 };
+						sformat(entry, sizeof(entry), ",%s.%s",
+								filters->excludeTableList.array[i].nspname,
+								filters->excludeTableList.array[i].relname);
+						strlcat(specs->wal2jsonFilterTables, entry,
+								sizeof(specs->wal2jsonFilterTables));
+					}
+				}
+				else if (filters->type == SOURCE_FILTER_TYPE_INCL)
+				{
+					bool first = true;
+
+					for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
+					{
+						char entry[BUFSIZE] = { 0 };
+						sformat(entry, sizeof(entry), "%s%s.*",
+								first ? "" : ",",
+								filters->includeOnlySchemaList.array[i].nspname);
+						strlcat(specs->wal2jsonAddTables, entry,
+								sizeof(specs->wal2jsonAddTables));
+						first = false;
+					}
+
+					for (int i = 0; i < filters->includeOnlyTableList.count; i++)
+					{
+						char entry[BUFSIZE] = { 0 };
+						sformat(entry, sizeof(entry), "%s%s.%s",
+								first ? "" : ",",
+								filters->includeOnlyTableList.array[i].nspname,
+								filters->includeOnlyTableList.array[i].relname);
+						strlcat(specs->wal2jsonAddTables, entry,
+								sizeof(specs->wal2jsonAddTables));
+						first = false;
+					}
+
+					if (!IS_EMPTY_STRING_BUFFER(specs->wal2jsonAddTables))
+					{
+						int idx = specs->pluginOptions.count;
+						specs->pluginOptions.keywords[idx] = "add-tables";
+						specs->pluginOptions.values[idx] = specs->wal2jsonAddTables;
+						specs->pluginOptions.count++;
+					}
+				}
+			}
+
+			/* Point filter-tables at our stable buffer (index 5) */
+			specs->pluginOptions.values[5] = specs->wal2jsonFilterTables;
+
 			break;
 		}
 
@@ -167,6 +248,11 @@ stream_init_specs(StreamSpecs *specs,
 					  OutputPluginToString(slot->plugin));
 			return false;
 		}
+	}
+
+	if (filters != NULL)
+	{
+		specs->filters = *filters;
 	}
 
 	strlcpy(specs->origin, origin, sizeof(specs->origin));

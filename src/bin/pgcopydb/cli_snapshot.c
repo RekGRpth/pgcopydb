@@ -327,7 +327,10 @@ cli_create_snapshot(int argc, char **argv)
 							   &(copySpecs.catalogs.replay),
 							   createSNoptions.stdIn,
 							   createSNoptions.stdOut,
-							   logSQL))
+							   logSQL,
+							   createSNoptions.replayNoOpUpdates,
+							   &(copySpecs.filters),
+							   &(copySpecs.catalogs.target)))
 		{
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);

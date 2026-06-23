@@ -37,6 +37,11 @@ extern KeyVal connStringDefaults;
 /*
  * pgcopydb creates System V OS level objects such as message queues and
  * semaphores, and those have to be cleaned-up "manually".
+ *
+ * With --all-databases, all per-database catalog semaphores are packed into
+ * a single SysV semaphore set (one system_res_array slot regardless of the
+ * number of databases).  The fixed overhead is ~10 slots, so 16 is sufficient
+ * even for very large multi-database runs.
  */
 #define SYSV_RES_MAX_COUNT 16
 
@@ -132,6 +137,7 @@ typedef struct CopyTableDataSpec
 
 	CopyDataSection section;
 	bool resume;
+	bool allDatabases;          /* true when running --all-databases */
 
 	SourceTable *sourceTable;
 	CopyTableSummary summary;
@@ -205,6 +211,70 @@ typedef struct PreviousRunState
 } PreviousRunState;
 
 
+/*
+ * Per-database info needed by global COPY workers in --all-databases mode.
+ * The parent process populates this array before forking workers; workers
+ * read it via post-fork COW copy.
+ */
+typedef struct MultiDbInfo
+{
+	char datname[PG_NAMEDATALEN];   /* database name */
+	char snapshot[BUFSIZE];         /* snapshot ID exported by snapshot holder */
+	char source_pguri[BUFSIZE];     /* per-database source URI */
+	char target_pguri[BUFSIZE];     /* per-database target URI */
+	char topdir[MAXPGPATH];         /* per-database work dir */
+
+	/*
+	 * Slot within the parent-created semaphore SET that guards this database's
+	 * source.db catalog.  All databases share one SysV semaphore set (one
+	 * system_res_array slot); each database uses a unique slot index within it.
+	 * catalog_create_semaphore() skips creation when semId != 0.
+	 */
+	int catalogSemId;       /* semaphore set id (same for all databases) */
+	int catalogSemIndex;    /* slot index within the set for this database */
+} MultiDbInfo;
+
+
+/*
+ * Per-database connection cache entry used by global COPY workers in
+ * --all-databases mode.  Each entry holds a heap-allocated per-database
+ * CopyDataSpec (catalog + paths + snapshot connection) and a target PGSQL
+ * connection.
+ */
+struct CopyDataSpec;             /* forward declaration */
+
+typedef struct MultiDbEntry
+{
+	char datname[PG_NAMEDATALEN];
+	bool active;
+	struct CopyDataSpec *dbSpecs; /* heap-allocated per-database specs */
+	PGSQL dst;                    /* target connection for this database */
+} MultiDbEntry;
+
+#define MULTIDB_ENTRY_CACHE_MAX 4
+
+typedef struct MultiDbContext
+{
+	struct CopyDataSpec *parentSpecs;
+	int count;
+	int nextEvict;               /* round-robin eviction index */
+	MultiDbEntry entries[MULTIDB_ENTRY_CACHE_MAX];
+} MultiDbContext;
+
+/*
+ * Lightweight table entry used by the global COPY supervisor to collect and
+ * sort tables from all databases before enqueuing.
+ */
+typedef struct MultiDbTableEntry
+{
+	char datname[PG_NAMEDATALEN];
+	uint32_t oid;
+	int64_t bytes;
+	bool excludeData;
+	int partCount;               /* 0 when not partitioned */
+} MultiDbTableEntry;
+
+
 /* all that's needed to start a TABLE DATA copy for a whole database */
 typedef struct CopyDataSpec
 {
@@ -240,8 +310,25 @@ typedef struct CopyDataSpec
 
 	bool fetchCatalogs;         /* cache invalidation of local catalogs db */
 	bool fetchFilteredOids;     /* allow bypassing dump/restore filter prep */
+	bool skipSourceURICheck;    /* skip source URI mismatch check on open */
 
 	bool follow;                /* pgcopydb fork --follow */
+	bool allDatabases;          /* pgcopydb clone --all-databases */
+
+	/*
+	 * Database name for log messages in per-database workers.  Empty string
+	 * in the single-database code path; set to the database name in
+	 * --all-databases workers so log messages include "in database <name>".
+	 */
+	char datname[PG_NAMEDATALEN];
+
+	/*
+	 * For --all-databases: per-database snapshot + connection info used by the
+	 * global COPY worker pool.  Populated by clone_all_databases() in the parent
+	 * before workers are forked, and read by workers (post-fork COW copy).
+	 */
+	int multiDbCount;
+	struct MultiDbInfo *multiDbInfos;
 
 	int tableJobs;
 	int indexJobs;
@@ -252,6 +339,7 @@ typedef struct CopyDataSpec
 	int splitMaxParts;
 	bool estimateTableSizes;
 
+	Queue preDataQueue;         /* for --all-databases Phase I parallel pre-data */
 	Queue copyQueue;
 	Queue indexQueue;
 	Queue vacuumQueue;
@@ -272,6 +360,8 @@ extern GUC dstSettings[];
 
 /* copydb.h */
 void cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section);
+
+bool copydb_clone_database(CopyDataSpec *copySpecs);
 
 bool copydb_init_workdir(CopyDataSpec *copySpecs,
 						 char *dir,
@@ -340,6 +430,7 @@ bool copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions);
 
 bool copydb_parse_extensions_requirements(CopyDataSpec *copySpecs,
 										  char *filename);
+bool copydb_create_pinned_extensions(CopyDataSpec *copySpecs);
 bool copydb_prepare_extensions_restore(CopyDataSpec *copySpecs);
 bool copydb_finalize_extensions_restore(CopyDataSpec *copySpecs);
 
@@ -347,7 +438,7 @@ bool timescaledb_pre_restore(CopyDataSpec *copySpecs, SourceExtension *ext);
 bool timescaledb_post_restore(CopyDataSpec *copySpecs, SourceExtension *ext);
 
 /* indexes.c */
-bool copydb_start_index_supervisor(CopyDataSpec *specs);
+bool copydb_start_index_supervisor(CopyDataSpec *specs, pid_t *pidOut);
 bool copydb_index_supervisor(CopyDataSpec *specs);
 bool copydb_start_index_workers(CopyDataSpec *specs);
 bool copydb_index_worker(CopyDataSpec *specs);
@@ -394,6 +485,7 @@ bool copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
 												ArchiveContentItem *item);
 
 bool copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section);
+bool copydb_write_schemas_restore_list(CopyDataSpec *specs);
 
 /* sequences.c */
 bool copydb_copy_all_sequences(CopyDataSpec *specs, bool reset);
@@ -430,8 +522,14 @@ bool copydb_start_table_data_workers(CopyDataSpec *specs);
 bool copydb_table_data_worker(CopyDataSpec *specs);
 
 bool copydb_add_copy(CopyDataSpec *specs, uint32_t oid, uint32_t part);
+bool copydb_add_copy_for_db(CopyDataSpec *specs, uint32_t oid, uint32_t part,
+							const char *datname);
 bool copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src,
 							 PGSQL *dst, uint32_t oid, uint32_t part);
+
+/* --all-databases global COPY phase */
+bool copydb_table_data_worker_multidb(CopyDataSpec *parentSpecs);
+bool copydb_copy_worker_queue_tables_multidb(CopyDataSpec *parentSpecs);
 
 bool copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 					   CopyTableDataSpec *tableSpecs);
@@ -469,12 +567,12 @@ bool copydb_add_blob(CopyDataSpec *specs, uint32_t oid);
 bool copydb_send_lo_stop(CopyDataSpec *specs);
 
 /* vacuum.c */
-bool vacuum_start_supervisor(CopyDataSpec *specs);
+bool vacuum_start_supervisor(CopyDataSpec *specs, pid_t *pidOut);
 bool vacuum_supervisor(CopyDataSpec *specs);
 bool vacuum_start_workers(CopyDataSpec *specs);
 bool vacuum_worker(CopyDataSpec *specs);
 bool vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid);
-bool vacuum_add_table(CopyDataSpec *specs, uint32_t oid);
+bool vacuum_add_table(CopyDataSpec *specs, uint32_t oid, const char *datname);
 bool vacuum_send_stop(CopyDataSpec *specs);
 
 /* sentinel.c */
@@ -571,6 +669,8 @@ bool summary_update_table_copy_stats(DatabaseCatalog *catalog,
 bool summary_delete_table(DatabaseCatalog *catalog,
 						  CopyTableDataSpec *tableSpecs);
 
+bool summary_delete_incomplete_table_copy(DatabaseCatalog *catalog);
+
 bool summary_table_count_parts_done(DatabaseCatalog *catalog,
 									CopyTableDataSpec *tableSpecs);
 
@@ -616,6 +716,17 @@ bool summary_add_constraint(DatabaseCatalog *catalog,
 bool summary_finish_constraint(DatabaseCatalog *catalog,
 							   CopyIndexSpec *indexSpecs);
 
+bool summary_lookup_extension(DatabaseCatalog *catalog,
+							  CopyExtensionSummary *extSummary);
+
+bool summary_extension_fetch(SQLiteQuery *query);
+
+bool summary_add_extension(DatabaseCatalog *catalog,
+						   CopyExtensionSummary *extSummary);
+
+bool summary_finish_extension(DatabaseCatalog *catalog,
+							  CopyExtensionSummary *extSummary);
+
 bool summary_table_count_indexes_left(DatabaseCatalog *catalog,
 									  CopyTableDataSpec *tableSpecs);
 
@@ -634,9 +745,23 @@ bool summary_prepare_index_entry(DatabaseCatalog *catalog,
 								 bool constraint,
 								 SummaryIndexEntry *indexEntry);
 
+/* multi_db.c (worker helpers called from table-data.c) */
+bool multidb_context_init(MultiDbContext *ctx, CopyDataSpec *parentSpecs);
+MultiDbEntry * multidb_context_get_entry(MultiDbContext *ctx,
+										 const char *datname);
+bool multidb_context_close_entry(MultiDbEntry *entry);
+bool multidb_context_close_all(MultiDbContext *ctx);
+
+/* lighter pool for index/vacuum workers: catalog + target only, no snapshot */
+MultiDbEntry * multidb_index_context_get_entry(MultiDbContext *ctx,
+											   const char *datname);
+bool multidb_index_context_close_all(MultiDbContext *ctx);
+
 /* compare.c */
 bool compare_schemas(CopyDataSpec *copySpecs);
 bool compare_data(CopyDataSpec *copySpecs);
+bool compare_all_databases_schema(CopyDataSpec *parentSpecs);
+bool compare_all_databases_data(CopyDataSpec *parentSpecs);
 
 bool compare_start_workers(CopyDataSpec *copySpecs, Queue *queue);
 bool compare_queue_tables(CopyDataSpec *copySpecs, Queue *queue);

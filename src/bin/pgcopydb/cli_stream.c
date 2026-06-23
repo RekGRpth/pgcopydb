@@ -61,6 +61,7 @@ static CommandLine stream_setup_command =
 		"  --snapshot                    Use snapshot obtained with pg_export_snapshot\n"
 		"  --plugin                      Output plugin to use (pgoutput, test_decoding, wal2json)\n"
 		"  --wal2json-numeric-as-string  Print numeric data type as string when using wal2json output plugin\n"
+		"  --replay-no-op-updates        Replay UPDATE statements even when no column values changed\n"
 		"  --slot-name                   Stream changes recorded by this slot\n"
 		"  --origin                      Name of the Postgres replication origin\n",
 		cli_stream_getopts,
@@ -208,6 +209,7 @@ cli_stream_getopts(int argc, char **argv)
 		{ "origin", required_argument, NULL, 'o' },
 		{ "endpos", required_argument, NULL, 'E' },
 		{ "max-replaydb-size", required_argument, NULL, 1003 },
+		{ "replay-no-op-updates", no_argument, NULL, 1004 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "restart", no_argument, NULL, 'r' },
@@ -342,6 +344,13 @@ cli_stream_getopts(int argc, char **argv)
 				log_trace("--endpos %X/%X",
 						  (uint32_t) (options.endpos >> 32),
 						  (uint32_t) options.endpos);
+				break;
+			}
+
+			case 1004:      /* --replay-no-op-updates */
+			{
+				options.replayNoOpUpdates = true;
+				log_trace("--replay-no-op-updates");
 				break;
 			}
 
@@ -632,7 +641,10 @@ cli_stream_setup(int argc, char **argv)
 						   &(copySpecs.catalogs.replay),
 						   streamDBoptions.stdIn,
 						   streamDBoptions.stdOut,
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -785,7 +797,10 @@ cli_stream_catchup(int argc, char **argv)
 						   &(copySpecs.catalogs.replay),
 						   streamDBoptions.stdIn,
 						   streamDBoptions.stdOut,
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -874,7 +889,10 @@ cli_stream_replay(int argc, char **argv)
 						   &(copySpecs.catalogs.replay),
 						   true,  /* stdin */
 						   true, /* stdout */
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -976,7 +994,10 @@ cli_stream_transform(int argc, char **argv)
 							   &(copySpecs.catalogs.replay),
 							   true,    /* stdIn */
 							   true,    /* stdOut */
-							   logSQL))
+							   logSQL,
+							   streamDBoptions.replayNoOpUpdates,
+							   NULL,
+							   &(copySpecs.catalogs.target)))
 		{
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
@@ -1047,7 +1068,10 @@ cli_stream_transform(int argc, char **argv)
 						   &(copySpecs.catalogs.replay),
 						   false, /* stdIn */
 						   false, /* stdOut */
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
@@ -1170,7 +1194,10 @@ cli_stream_apply(int argc, char **argv)
 							   &(copySpecs.catalogs.replay),
 							   true,   /* stdIn */
 							   false,  /* stdOut */
-							   logSQL))
+							   logSQL,
+							   streamDBoptions.replayNoOpUpdates,
+							   NULL,
+							   &(copySpecs.catalogs.target)))
 		{
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
@@ -1262,7 +1289,10 @@ cli_stream_apply(int argc, char **argv)
 						   &(copySpecs.catalogs.replay),
 						   false, /* stdIn */
 						   stdoutMode, /* stdOut */
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -1415,7 +1445,10 @@ stream_start_in_mode(LogicalStreamMode mode)
 						   &(copySpecs.catalogs.replay),
 						   streamDBoptions.stdIn,
 						   streamDBoptions.stdOut,
-						   logSQL))
+						   logSQL,
+						   streamDBoptions.replayNoOpUpdates,
+						   NULL,
+						   &(copySpecs.catalogs.target)))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);

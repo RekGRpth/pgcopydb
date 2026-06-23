@@ -217,3 +217,83 @@ create table xpto2 (
 );
 
 commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/969
+-- Single-quote escaping for varchar/text columns via test_decoding.
+-- Two bugs were fixed:
+--   1. VARCHAR (and other non-text quoted types) had their '' pairs left
+--      doubled in the generated SQL instead of being unescaped to a single '.
+--   2. A value ending in a single-quote had its last character silently
+--      dropped because the unescaping loop consumed the closing ' as the
+--      first half of a doubled-quote pair.
+--
+begin;
+
+create table if not exists quote_escaping_test
+(
+    id bigint primary key,
+    varchar_col varchar(100),
+    text_col text
+);
+
+commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/968
+-- Loss of double precision during CDC replay: %f only gives 6 decimal places.
+--
+begin;
+
+create table float8_precision_test
+(
+    id   bigint primary key,
+    val  double precision
+);
+
+commit;
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/844
+-- CDC UPDATE fails for GENERATED ALWAYS AS IDENTITY columns
+--
+-- id_col is a non-PK GENERATED ALWAYS AS IDENTITY column: UPDATE must not
+-- include it in the SET clause (PostgreSQL rejects "SET id_col = $N").
+--
+begin;
+
+create table identity_column_test
+(
+    pk_col bigint primary key,
+    id_col integer generated always as identity,
+    name   text
+);
+
+commit;
+
+--
+-- Tables for no-op UPDATE testing (--replay-no-op-updates, issue #983)
+--
+begin;
+
+-- REPLICA IDENTITY FULL: test_decoding emits old-key: and new-tuple: with
+-- identical values for a no-op UPDATE.  The transform layer compares them and
+-- skips by default; --replay-no-op-updates disables the skip.
+create table noop_update_test (
+    id  bigint primary key,
+    val text
+);
+
+alter table noop_update_test replica identity full;
+
+-- All columns are part of the primary key.  A no-op UPDATE (SET a = a) has
+-- no old-key: prefix in the test_decoding message, and prepareUpdateTupleArrays
+-- finds newCount == 0 (nothing for the SET clause).  The UPDATE must be
+-- skipped gracefully rather than aborting the apply process.
+create table all_pk_test (
+    a bigint,
+    b bigint,
+    primary key (a, b)
+);
+
+commit;

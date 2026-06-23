@@ -28,6 +28,7 @@ typedef struct SourceDatabase
 	char datname[PG_NAMEDATALEN];
 	int64_t bytes;
 	char bytesPretty[PG_NAMEDATALEN]; /* pg_size_pretty */
+	char snapshot[BUFSIZE];           /* exported snapshot ID, or "" */
 } SourceDatabase;
 
 
@@ -128,6 +129,9 @@ typedef struct SourceTableAttribute
 	bool attisprimary;
 	bool attisreplident;
 	bool attisgenerated;
+	char attidentity;           /* 'a' GENERATED ALWAYS, 'd' BY DEFAULT, '\0' none */
+	bool attisbinarycompatible; /* false when type is unsafe for COPY BINARY */
+	char atttypsend[PG_NAMEDATALEN]; /* comma-separated send func names */
 } SourceTableAttribute;
 
 typedef struct SourceTableAttributeArray
@@ -139,8 +143,8 @@ typedef struct SourceTableAttributeArray
 /* forward declaration */
 struct SourceIndexList;
 
-/* checksum is formatted as uuid */
-#define CHECKSUMLEN 36
+/* checksum is a SHA256 hex digest (64 hex chars + NUL) */
+#define CHECKSUMLEN 65
 
 typedef struct TableChecksum
 {
@@ -152,6 +156,7 @@ typedef struct SourceTable
 {
 	uint32_t oid;
 
+	char datname[PG_NAMEDATALEN];
 	char qname[PG_NAMEDATALEN_FQ];
 	char nspname[PG_NAMEDATALEN];
 	char relname[PG_NAMEDATALEN];
@@ -220,6 +225,7 @@ typedef struct SourceSequence
 	uint32_t attrelid;          /* pg_class oid of table using as DEFAULT */
 	uint32_t attroid;           /* pg_attrdef DEFAULT value OID */
 
+	char datname[PG_NAMEDATALEN];
 	char qname[PG_NAMEDATALEN_FQ];
 	char nspname[PG_NAMEDATALEN];
 	char relname[PG_NAMEDATALEN];
@@ -376,6 +382,17 @@ typedef struct CatalogSection
 	uint64_t durationMs;
 } CatalogSection;
 
+/*
+ * Prepared-statement cache entry — forward declared here so DatabaseCatalog
+ * can embed the hash-table pointer.  The full definition lives in catalog.h.
+ */
+typedef struct CachedStmt
+{
+	const char *sql;            /* hash key (pointer identity of a literal) */
+	sqlite3_stmt *stmt;
+	UT_hash_handle hh;
+} CachedStmt;
+
 typedef struct DatabaseCatalog
 {
 	DatabaseCatalogType type;
@@ -388,6 +405,7 @@ typedef struct DatabaseCatalog
 	sqlite3 *db;
 
 	Semaphore sema;
+	CachedStmt *stmtCache;      /* prepared-statement cache, keyed by SQL ptr */
 } DatabaseCatalog;
 
 

@@ -14,6 +14,7 @@
 #include "sqlite3.h"
 
 #include "catalog.h"
+#include "pqexpbuffer.h"
 #include "copydb.h"
 #include "defaults.h"
 #include "log.h"
@@ -27,7 +28,27 @@
 /*
  * pgcopydb catalog cache is a SQLite database with the following schema:
  */
-static char *sourceDBcreateDDLs[] = {
+
+/*
+ * pgcopydb catalog cache is a SQLite database with the following schema.
+ *
+ * Note: indexes are split from tables for two reasons:
+ *
+ *  1. Two new non-unique indexes (s_i_tableoid, s_c_indexoid) are built after
+ *     bulk data load so they land on a fully-populated table, which is 3-5×
+ *     faster than maintaining them row-by-row.  They fix the O(N²) scan in
+ *     catalog_s_table_count_indexes (called ~211K times on a 317K-row table).
+ *
+ *  2. catalog_create_indexes() is also called when resuming an operation on an
+ *     existing catalog that pre-dates these indexes.  Using IF NOT EXISTS makes
+ *     every call idempotent.
+ *
+ * All *other* indexes (including all UNIQUE indexes) are kept in the table DDL
+ * arrays so that catalog_create_schema() installs them on the empty tables.
+ * This is critical for INSERT OR IGNORE / INSERT OR REPLACE semantics: SQLite
+ * needs the unique index present at insert time to suppress duplicates.
+ */
+static char *sourceDBcreateTableDDLs[] = {
 	"create table setup("
 	"  id integer primary key check (id = 1), "
 	"  source_pg_uri text, "
@@ -60,20 +81,17 @@ static char *sourceDBcreateDDLs[] = {
 	")",
 
 	"create table s_database("
-	"  oid integer primary key, datname text, bytes integer, bytes_pretty text"
+	"  oid integer primary key, datname text, bytes integer, bytes_pretty text,"
+	"  snapshot text"
 	")",
 
 	"create table s_database_property("
 	"  role_in_database boolean, rolname text, datname text, setconfig text"
 	")",
 
-	"create index s_d_p_oid on s_database_property(datname)",
-
 	"create table s_namespace("
 	"  nspname text primary key, restore_list_name text"
 	")",
-
-	"create index s_n_rlname on s_namespace(restore_list_name)",
 
 	"create table s_table("
 	"  oid integer primary key, "
@@ -84,36 +102,26 @@ static char *sourceDBcreateDDLs[] = {
 	"  part_key text"
 	")",
 
-	"create unique index s_t_qname on s_table(qname)",
-	"create unique index s_t_rlname on s_table(restore_list_name)",
-
 	"create table s_matview("
 	"  oid integer primary key, "
 	"  qname text, nspname text, relname text, restore_list_name text, "
 	"  exclude_data boolean"
 	")",
 
-	"create unique index s_mv_rlname on s_matview(restore_list_name)",
-	"create unique index s_mv_qname on s_matview(nspname, relname)",
-
 	"create table s_table_size("
 	"  oid integer primary key references s_table(oid), "
 	"  bytes integer, bytes_pretty text "
 	")",
 
-	"create unique index s_ts_oid on s_table_size(oid)",
-
 	"create table s_attr("
 	"  oid integer references s_table(oid), "
 	"  attnum integer, attypid integer, attname text, "
 	"  attisprimary bool, attisreplident bool, attisgenerated bool, "
+	"  attidentity text default '', "
+	"  attisbinarycompatible bool default true, "
+	"  atttypsend text default '', "
 	"  primary key(oid, attnum) "
 	")",
-
-	"create index s_a_oid_attname on s_attr(oid, attname)",
-
-	/* index for filtering out generated columns */
-	"create index s_a_attisgenerated on s_attr(attisgenerated) where attisgenerated",
 
 	"create table s_table_part("
 	"  oid integer references s_table(oid), "
@@ -134,8 +142,6 @@ static char *sourceDBcreateDDLs[] = {
 	"  isprimary bool, isunique bool, columns text, sql text "
 	")",
 
-	"create unique index s_i_rlname on s_index(restore_list_name)",
-
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
 	"  indexoid references s_index(oid), "
@@ -150,8 +156,6 @@ static char *sourceDBcreateDDLs[] = {
 	"  last_value integer, isCalled bool, "
 	"  primary key(oid, ownedby, attrelid, attroid)"
 	")",
-
-	"create index s_s_rlname on s_seq(restore_list_name)",
 
 	/* internal activity tracking / completion / statistics */
 	"create table process("
@@ -176,6 +180,7 @@ static char *sourceDBcreateDDLs[] = {
 	"  partnum integer, "
 	"  indexoid integer references s_index(oid), "
 	"  conoid integer references s_constraint(oid), "
+	"  extoid integer, "
 	"  start_time_epoch integer, done_time_epoch integer, duration integer, "
 	"  bytes integer, "
 	"  command text, "
@@ -236,7 +241,38 @@ static char *sourceDBcreateDDLs[] = {
 	"  last_txn_end_lsn    pg_lsn, "             /* NULL = transaction still open */
 	"  last_txn_complete   integer, "            /* 1 = had COMMIT or ROLLBACK */
 	"  last_txn_processed  integer"              /* 1 = fully written/applied */
-	")"
+	")",
+
+	/* All indexes other than s_i_tableoid / s_c_indexoid stay here so they are
+	 * created on empty tables and enforce uniqueness during data load. */
+	"create index s_d_p_oid on s_database_property(datname)",
+	"create index s_n_rlname on s_namespace(restore_list_name)",
+	"create unique index s_t_qname on s_table(qname)",
+	"create unique index s_t_rlname on s_table(restore_list_name)",
+	"create unique index s_mv_rlname on s_matview(restore_list_name)",
+	"create unique index s_mv_qname on s_matview(nspname, relname)",
+	"create unique index s_ts_oid on s_table_size(oid)",
+	"create index s_a_oid_attname on s_attr(oid, attname)",
+	"create index s_a_attisgenerated on s_attr(attisgenerated) where attisgenerated",
+	"create unique index s_i_rlname on s_index(restore_list_name)",
+	"create index s_s_rlname on s_seq(restore_list_name)",
+	"create unique index summary_extoid on summary(extoid) where extoid is not null"
+};
+
+
+/*
+ * Two non-unique indexes deferred until after bulk data load.  Building them
+ * on a fully-populated table is 3-5× faster and they fix the O(N²) scan in
+ * catalog_s_table_count_indexes (called ~211K times against a 317K-row table):
+ *
+ *   s_i_tableoid — s_index rows looked up by tableoid for every table copy
+ *   s_c_indexoid — s_constraint rows joined to s_index by indexoid
+ *
+ * IF NOT EXISTS makes every call idempotent (safe for --resume / multi-step).
+ */
+static char *sourceDBcreateIndexDDLs[] = {
+	"create index if not exists s_i_tableoid on s_index(tableoid)",
+	"create index if not exists s_c_indexoid on s_constraint(indexoid)"
 };
 
 
@@ -255,7 +291,7 @@ static char *sourceDBcreateDDLs[] = {
  * maintain a separate SQLite database for the filters catalog cache.
  *
  */
-static char *filterDBcreateDDLs[] = {
+static char *filterDBcreateTableDDLs[] = {
 	"create table section("
 	"  name text primary key, fetched boolean, "
 	"  start_time_epoch integer, done_time_epoch integer, duration integer"
@@ -265,8 +301,6 @@ static char *filterDBcreateDDLs[] = {
 	"  oid integer primary key, collname text, description text, "
 	"  restore_list_name text"
 	")",
-
-	"create unique index s_coll_rlname on s_coll(restore_list_name)",
 
 	"create table s_extension("
 	"  oid integer primary key, extname text, extnamespace text, "
@@ -279,8 +313,6 @@ static char *filterDBcreateDDLs[] = {
 	"  relkind integer "
 	")",
 
-	"create index s_ec_oid on s_extension_config(extoid)",
-
 	"create table s_extension_versions("
 	"  oid integer, name text, default_version text, installed_version text, "
 	"  versions_array text, "
@@ -290,8 +322,6 @@ static char *filterDBcreateDDLs[] = {
 	"create table s_namespace("
 	"  oid integer primary key, nspname text, restore_list_name text "
 	")",
-
-	"create index s_n_rlname on s_namespace(restore_list_name)",
 
 	"create table s_table("
 	"  oid integer primary key, "
@@ -303,29 +333,24 @@ static char *filterDBcreateDDLs[] = {
 	"  part_key text"
 	")",
 
-	"create unique index s_t_qname on s_table(qname)",
-	"create unique index s_t_rlname on s_table(restore_list_name)",
-
 	"create table s_matview("
 	"  oid integer primary key, "
 	"  qname text, nspname text, relname text, restore_list_name text, "
 	"  exclude_data boolean"
 	")",
 
-	"create unique index s_mv_rlname on s_matview(restore_list_name)",
-	"create unique index s_mv_qname on s_matview(nspname, relname)",
-
 	"create table s_table_size("
 	"  oid integer primary key references s_table(oid), "
 	"  bytes integer, bytes_pretty text "
 	")",
 
-	"create unique index s_ts_oid on s_table_size(oid)",
-
 	"create table s_attr("
 	"  oid integer references s_table(oid), "
 	"  attnum integer, attypid integer, attname text, "
 	"  attisprimary bool, attisreplident bool, attisgenerated bool, "
+	"  attidentity text default '', "
+	"  attisbinarycompatible bool default true, "
+	"  atttypsend text default '', "
 	"  primary key(oid, attnum) "
 	")",
 
@@ -348,8 +373,6 @@ static char *filterDBcreateDDLs[] = {
 	"  isprimary bool, isunique bool, columns text, sql text "
 	")",
 
-	"create unique index s_i_rlname on s_index(restore_list_name)",
-
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
 	"  indexoid references s_index(oid), "
@@ -365,25 +388,30 @@ static char *filterDBcreateDDLs[] = {
 	"  primary key(oid, ownedby, attrelid, attroid)"
 	")",
 
-	"create index s_s_rlname on s_seq(restore_list_name)",
-
 	"create table s_depend("
 	"  nspname text, relname text, "
 	"  refclassid integer, refobjid integer, classid integer, objid integer, "
 	"  deptype text, type text, identity text "
 	")",
 
-	"create index s_d_refobjid on s_depend(refobjid)",
-	"create index s_d_objid on s_depend(objid)",
+	/* catalog namespace lookup: OIDs of system catalog tables, fetched at runtime */
+	"create table catnames(oid integer primary key, catname text unique)",
 
-	/* the filter table is our hash-table */
-	"create table filter(oid integer, restore_list_name text, kind text)",
-	"create unique index filter_oid on filter(oid) where oid > 0",
+	/*
+	 * The filter table is our hash-table.  catoid mirrors pg_depend.classid:
+	 * it is the OID of the system catalog table that owns the object (e.g.
+	 * pg_class for tables/indexes/sequences, pg_constraint for constraints).
+	 * Using (catoid, oid) as the lookup key avoids false matches when OIDs
+	 * from different catalog namespaces happen to share the same numeric value.
+	 */
+	"create table filter(catoid integer, oid integer, restore_list_name text, kind text)",
 
-	"create unique index filter_oid_rlname on filter(oid, restore_list_name) "
-	" where oid > 0",
-
-	"create index filter_rlname on filter(restore_list_name)",
+	/*
+	 * extension_filter stores the user's [exclude-extension] and
+	 * [include-only-extension] configuration so that catalog_prepare_filter
+	 * can read it internally without needing it passed as C pointers.
+	 */
+	"create table extension_filter(extname text primary key, action text)",
 
 	/*
 	 * While we don't use a summary table in the filter database, some queries
@@ -396,18 +424,43 @@ static char *filterDBcreateDDLs[] = {
 	"  partnum integer, "
 	"  indexoid integer references s_index(oid), "
 	"  conoid integer references s_constraint(oid), "
+	"  extoid integer, "
 	"  start_time_epoch integer, done_time_epoch integer, duration integer, "
 	"  bytes integer, "
 	"  command text, "
 	"  unique(tableoid, partnum)"
 	")",
+
+	/* Indexes that must be present before data load (unique = INSERT OR IGNORE). */
+	"create unique index s_coll_rlname on s_coll(restore_list_name)",
+	"create index s_ec_oid on s_extension_config(extoid)",
+	"create index s_n_rlname on s_namespace(restore_list_name)",
+	"create unique index s_t_qname on s_table(qname)",
+	"create unique index s_t_rlname on s_table(restore_list_name)",
+	"create unique index s_mv_rlname on s_matview(restore_list_name)",
+	"create unique index s_mv_qname on s_matview(nspname, relname)",
+	"create unique index s_ts_oid on s_table_size(oid)",
+	"create unique index s_i_rlname on s_index(restore_list_name)",
+	"create index s_s_rlname on s_seq(restore_list_name)",
+	"create index s_d_refobjid on s_depend(refobjid)",
+	"create index s_d_objid on s_depend(objid)",
+
+	/* filter_catoid_oid is critical: INSERT OR IGNORE into filter() relies on it. */
+	"create unique index filter_catoid_oid on filter(catoid, oid) where oid > 0",
+	"create index filter_rlname on filter(restore_list_name)"
+};
+
+/* Deferred indexes for filter DB — same two non-unique performance indexes. */
+static char *filterDBcreateIndexDDLs[] = {
+	"create index if not exists s_i_tableoid on s_index(tableoid)",
+	"create index if not exists s_c_indexoid on s_constraint(indexoid)"
 };
 
 
 /*
  * Target schema objects, allowing to skip pre-existing entries.
  */
-static char *targetDBcreateDDLs[] = {
+static char *targetDBcreateTableDDLs[] = {
 	"create table section("
 	"  name text primary key, fetched boolean, "
 	"  start_time_epoch integer, done_time_epoch integer, duration integer"
@@ -421,8 +474,6 @@ static char *targetDBcreateDDLs[] = {
 	"  nspname text primary key, restore_list_name text"
 	")",
 
-	"create index s_n_rlname on s_namespace(restore_list_name)",
-
 	"create table s_table("
 	"  oid integer primary key, "
 	"  datname text, qname text, nspname text, relname text, amname text, "
@@ -433,13 +484,13 @@ static char *targetDBcreateDDLs[] = {
 	"  part_key text"
 	")",
 
-	"create unique index s_t_qname on s_table(qname)",
-	"create unique index s_t_rlname on s_table(restore_list_name)",
-
 	"create table s_attr("
 	"  oid integer references s_table(oid), "
 	"  attnum integer, attypid integer, attname text, "
 	"  attisprimary bool, attisreplident bool, attisgenerated bool, "
+	"  attidentity text default '', "
+	"  attisbinarycompatible bool default true, "
+	"  atttypsend text default '', "
 	"  primary key(oid, attnum) "
 	")",
 
@@ -450,13 +501,29 @@ static char *targetDBcreateDDLs[] = {
 	"  isprimary bool, isunique bool, columns text, sql text "
 	")",
 
-	"create unique index s_i_rlname on s_index(restore_list_name)",
-
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
 	"  indexoid references s_index(oid), "
 	"  condeferrable bool, condeferred bool, sql text "
-	")"
+	")",
+
+	"create table s_rel("
+	"  nspname text not null, relname text not null, "
+	"  relkind char(1) not null, ispopulated bool, "
+	"  primary key(nspname, relname)"
+	")",
+
+	/* Indexes created before data load (unique indexes need to be inline). */
+	"create index s_n_rlname on s_namespace(restore_list_name)",
+	"create unique index s_t_qname on s_table(qname)",
+	"create unique index s_t_rlname on s_table(restore_list_name)",
+	"create unique index s_i_rlname on s_index(restore_list_name)"
+};
+
+/* Deferred indexes for target DB — same two non-unique performance indexes. */
+static char *targetDBcreateIndexDDLs[] = {
+	"create index if not exists s_i_tableoid on s_index(tableoid)",
+	"create index if not exists s_c_indexoid on s_constraint(indexoid)"
 };
 
 
@@ -501,6 +568,7 @@ static char *replayDBcreateDDLs[] = {
 	"create table replay("
 	"  id integer primary key, "
 	"  action text, xid integer, lsn integer, endlsn integer, timestamp text, "
+	"  nspname text, relname text, "
 	"  stmt_hash text references stmt(hash), stmt_args jsonb)",
 
 	"create index r_xid on replay(xid)",
@@ -571,7 +639,8 @@ static char *targetDBdropDDLs[] = {
 	"drop table if exists s_table",
 	"drop table if exists s_attr",
 	"drop table if exists s_index",
-	"drop table if exists s_constraint"
+	"drop table if exists s_constraint",
+	"drop table if exists s_rel"
 };
 
 
@@ -704,6 +773,7 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 	/*
 	 * Now see if the catalog already have been setup.
 	 */
+
 	if (!catalog_setup(sourceDB))
 	{
 		/* errors have already been logged */
@@ -744,12 +814,23 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 
 		if (!streq(spguri.pguri, setup->source_pguri))
 		{
-			log_error("Catalogs at \"%s\" have been setup for "
-					  "Postgres source \"%s\" and current source is \"%s\"",
-					  sourceDB->dbfile,
-					  setup->source_pguri,
-					  spguri.pguri);
-			return false;
+			if (copySpecs->skipSourceURICheck)
+			{
+				log_debug("Catalogs at \"%s\" have been setup for "
+						  "a different Postgres source \"%s\", "
+						  "ignoring for this read-only command",
+						  sourceDB->dbfile,
+						  setup->source_pguri);
+			}
+			else
+			{
+				log_error("Catalogs at \"%s\" have been setup for "
+						  "Postgres source \"%s\" and current source is \"%s\"",
+						  sourceDB->dbfile,
+						  setup->source_pguri,
+						  spguri.pguri);
+				return false;
+			}
 		}
 
 		/*
@@ -854,23 +935,21 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 
 		if (!streq(json, setup->filters))
 		{
-			log_info("Current filtering setup is: %s", json);
-			log_info("Catalog filtering setup is: %s", setup->filters);
-
-			/* If catalog has no filters but current command does, it's probably a clone command
-			 * after another command (like snapshot). Use the filters from the current command
-			 */
 			if (strstr(setup->filters, "SOURCE_FILTER_TYPE_NONE") != NULL &&
 				strstr(json, "SOURCE_FILTER_TYPE_NONE") == NULL)
 			{
-				log_warn("Catalogs at \"%s\" have been setup for a different "
-						 "filtering than the current command, "
-						 "see above for details",
+				/*
+				 * Catalog was created without filters (e.g. by pgcopydb
+				 * snapshot) and the current command uses filters (e.g.
+				 * pgcopydb clone --filters). Update the stored filter so
+				 * subsequent commands see the right setup.
+				 */
+				log_info("Current filtering setup is: %s", json);
+				log_info("Catalog filtering setup is: %s", setup->filters);
+				log_warn("Catalogs at \"%s\" have been setup without filters; "
+						 "updating to current command filters",
 						 sourceDB->dbfile);
-				log_warn("Updating catalog filters from \"%s\" to \"%s\"",
-						 setup->filters, json);
 
-				/* Update the filters in the catalog database */
 				if (!catalog_update_filters(sourceDB, json))
 				{
 					log_error("Failed to update filters in catalog database");
@@ -878,19 +957,20 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 					return false;
 				}
 
-				/* Update the local setup structure */
 				if (setup->filters != NULL)
 				{
 					free(setup->filters);
 				}
 				setup->filters = strdup(json);
 
-				log_warn("Successfully updated catalog filters");
+				log_info("Catalog filters updated to: %s", setup->filters);
 			}
 			else if (strstr(setup->filters, "SOURCE_FILTER_TYPE_NONE") == NULL &&
 					 strstr(json, "SOURCE_FILTER_TYPE_NONE") == NULL)
 			{
-				/* If both have different filters, something is wrong */
+				/* Both sides have filters but they differ — genuine conflict. */
+				log_info("Current filtering setup is: %s", json);
+				log_info("Catalog filtering setup is: %s", setup->filters);
 				log_error("Catalogs at \"%s\" have been setup for a different "
 						  "filtering than the current command, "
 						  "see above for details",
@@ -901,17 +981,22 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 			else if (strstr(setup->filters, "SOURCE_FILTER_TYPE_NONE") == NULL &&
 					 strstr(json, "SOURCE_FILTER_TYPE_NONE") != NULL)
 			{
-				/* If the catalog has filters but current command doesn't, it's probably a command
-				 * (like stream or list) after a clone. Continue with previously used filters in the catalog */
-				log_warn("Catalogs at \"%s\" have been setup for a different "
-						 "filtering than the current command, "
-						 "see above for details",
-						 sourceDB->dbfile);
-				log_warn("Using previously configured filters");
+				/*
+				 * Catalog was created with filters; the current command has
+				 * none (e.g. pgcopydb list table-parts, pgcopydb stream
+				 * sentinel). These read-only commands operate on the already-
+				 * filtered catalog data and do not need --filters repeated.
+				 * Silently adopt the catalog's stored filter.
+				 */
+				log_debug("Adopting catalog's stored filters for this command "
+						  "(catalog: %s)",
+						  setup->filters);
 			}
 			else
 			{
-				/* Any other unanticipated mismatch, default to an error*/
+				/* Unanticipated mismatch. */
+				log_info("Current filtering setup is: %s", json);
+				log_info("Catalog filtering setup is: %s", setup->filters);
 				log_error("Catalogs at \"%s\" have been setup for a different "
 						  "filtering than the current command, "
 						  "see above for details",
@@ -919,6 +1004,37 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 
 				return false;
 			}
+		}
+	}
+
+	/*
+	 * Populate extension_filter in the filter catalog from the in-memory
+	 * filter configuration so that catalog_prepare_filter can read it via
+	 * SQL without needing the C lists as parameters.
+	 */
+	DatabaseCatalog *filtersDB = &(copySpecs->catalogs.filter);
+
+	for (int i = 0; i < filters->excludeExtensionList.count; i++)
+	{
+		if (!catalog_add_extension_filter(
+				filtersDB,
+				filters->excludeExtensionList.array[i].extname,
+				"exclude"))
+		{
+			json_free_serialized_string(json);
+			return false;
+		}
+	}
+
+	for (int i = 0; i < filters->includeOnlyExtensionList.count; i++)
+	{
+		if (!catalog_add_extension_filter(
+				filtersDB,
+				filters->includeOnlyExtensionList.array[i].extname,
+				"include-only"))
+		{
+			json_free_serialized_string(json);
+			return false;
 		}
 	}
 
@@ -942,6 +1058,55 @@ catalog_open(DatabaseCatalog *catalog)
 	}
 
 	return catalog_init(catalog);
+}
+
+
+/*
+ * catalog_open_readonly opens an existing catalog file in read-only mode
+ * without creating or acquiring any semaphore.  Use this for catalogs that
+ * are only ever read (never written) — SQLite WAL provides snapshot-
+ * consistent reads with no contention between any number of readers.
+ */
+bool
+catalog_open_readonly(DatabaseCatalog *catalog)
+{
+	if (catalog->db != NULL)
+	{
+		log_debug("Skipping opening read-only SQLite database \"%s\": "
+				  "already opened", catalog->dbfile);
+		return true;
+	}
+
+	if (!file_exists(catalog->dbfile))
+	{
+		log_error("Failed to open catalog \"%s\", file does not exist",
+				  catalog->dbfile);
+		return false;
+	}
+
+	log_debug("Opening read-only SQLite database \"%s\"", catalog->dbfile);
+
+	int rc = sqlite3_open_v2(catalog->dbfile,
+							 &(catalog->db),
+							 SQLITE_OPEN_READONLY,
+							 NULL);
+
+	if (rc != SQLITE_OK)
+	{
+		const char *errmsg = sqlite3_errmsg(catalog->db);
+
+		log_error("Failed to open \"%s\" read-only: %s",
+				  catalog->dbfile, errmsg);
+
+		if (catalog->db != NULL)
+		{
+			sqlite3_close(catalog->db);
+		}
+		catalog->db = NULL;
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -1136,6 +1301,12 @@ catalog_close(DatabaseCatalog *catalog)
 		return true;
 	}
 
+	if (!catalog_close_stmts(catalog))
+	{
+		/* logged inside */
+		return false;
+	}
+
 	if (sqlite3_close(catalog->db) != SQLITE_OK)
 	{
 		log_error("Failed to close \"%s\":", catalog->dbfile);
@@ -1150,7 +1321,34 @@ catalog_close(DatabaseCatalog *catalog)
 
 
 /*
+ * catalog_close_stmts finalizes all cached prepared statements and frees the
+ * cache entries.
+ */
+bool
+catalog_close_stmts(DatabaseCatalog *catalog)
+{
+	CachedStmt *entry = NULL;
+	CachedStmt *tmp = NULL;
+
+	HASH_ITER(hh, catalog->stmtCache, entry, tmp)
+	{
+		HASH_DEL(catalog->stmtCache, entry);
+		sqlite3_finalize(entry->stmt);
+		free(entry);
+	}
+
+	catalog->stmtCache = NULL;
+
+	return true;
+}
+
+
+/*
  * catalog_create_schema creates the expected schema in the given catalog.
+ * This includes all tables and all indexes *except* s_i_tableoid and
+ * s_c_indexoid, which are deferred to catalog_create_indexes so they can
+ * be built on a fully-populated table (3-5× faster than maintaining them
+ * row-by-row during the bulk load).
  */
 bool
 catalog_create_schema(DatabaseCatalog *catalog)
@@ -1162,22 +1360,22 @@ catalog_create_schema(DatabaseCatalog *catalog)
 	{
 		case DATABASE_CATALOG_TYPE_SOURCE:
 		{
-			createDDLs = sourceDBcreateDDLs;
-			count = sizeof(sourceDBcreateDDLs) / sizeof(sourceDBcreateDDLs[0]);
+			createDDLs = sourceDBcreateTableDDLs;
+			count = sizeof(sourceDBcreateTableDDLs) / sizeof(sourceDBcreateTableDDLs[0]);
 			break;
 		}
 
 		case DATABASE_CATALOG_TYPE_FILTER:
 		{
-			createDDLs = filterDBcreateDDLs;
-			count = sizeof(filterDBcreateDDLs) / sizeof(filterDBcreateDDLs[0]);
+			createDDLs = filterDBcreateTableDDLs;
+			count = sizeof(filterDBcreateTableDDLs) / sizeof(filterDBcreateTableDDLs[0]);
 			break;
 		}
 
 		case DATABASE_CATALOG_TYPE_TARGET:
 		{
-			createDDLs = targetDBcreateDDLs;
-			count = sizeof(targetDBcreateDDLs) / sizeof(targetDBcreateDDLs[0]);
+			createDDLs = targetDBcreateTableDDLs;
+			count = sizeof(targetDBcreateTableDDLs) / sizeof(targetDBcreateTableDDLs[0]);
 			break;
 		}
 
@@ -1214,6 +1412,77 @@ catalog_create_schema(DatabaseCatalog *catalog)
 		if (rc != SQLITE_OK)
 		{
 			log_error("Failed to create catalog schema: %s", ddl);
+			log_error("%s", sqlite3_errmsg(catalog->db));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_create_indexes builds SQLite indexes after bulk data has been
+ * loaded.  Called once per catalog after the initial schema fetch completes.
+ *
+ * replay.db and output.db have their indexes inline in replayDBcreateDDLs /
+ * outputDBcreateDDLs and are not bulk-loaded, so they are skipped here.
+ */
+bool
+catalog_create_indexes(DatabaseCatalog *catalog)
+{
+	char **indexDDLs = NULL;
+	int count = 0;
+
+	switch (catalog->type)
+	{
+		case DATABASE_CATALOG_TYPE_SOURCE:
+		{
+			indexDDLs = sourceDBcreateIndexDDLs;
+			count = sizeof(sourceDBcreateIndexDDLs) / sizeof(sourceDBcreateIndexDDLs[0]);
+			break;
+		}
+
+		case DATABASE_CATALOG_TYPE_FILTER:
+		{
+			indexDDLs = filterDBcreateIndexDDLs;
+			count = sizeof(filterDBcreateIndexDDLs) / sizeof(filterDBcreateIndexDDLs[0]);
+			break;
+		}
+
+		case DATABASE_CATALOG_TYPE_TARGET:
+		{
+			indexDDLs = targetDBcreateIndexDDLs;
+			count = sizeof(targetDBcreateIndexDDLs) / sizeof(targetDBcreateIndexDDLs[0]);
+			break;
+		}
+
+		case DATABASE_CATALOG_TYPE_REPLAY:
+		case DATABASE_CATALOG_TYPE_OUTPUT:
+		{
+			/* indexes already created inline with tables */
+			return true;
+		}
+
+		default:
+		{
+			log_error("BUG: called catalog_create_indexes for unknown type %d",
+					  catalog->type);
+			return false;
+		}
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		char *ddl = indexDDLs[i];
+
+		log_sqlite("catalog_create_indexes: %s", ddl);
+
+		int rc = sqlite3_exec(catalog->db, ddl, NULL, NULL, NULL);
+
+		if (rc != SQLITE_OK)
+		{
+			log_error("Failed to create catalog index: %s", ddl);
 			log_error("%s", sqlite3_errmsg(catalog->db));
 			return false;
 		}
@@ -1486,6 +1755,19 @@ catalog_setup(DatabaseCatalog *catalog)
 		log_error("BUG: catalog_setup: db is NULL");
 		return false;
 	}
+
+	/*
+	 * Reset the setup struct before querying so that stale values inherited
+	 * from a parent CopyDataSpec (via struct copy) do not persist when the
+	 * catalog is fresh and the setup table has no rows.
+	 */
+	catalog->setup.id = 0;
+	catalog->setup.source_pguri = NULL;
+	catalog->setup.target_pguri = NULL;
+	catalog->setup.snapshot[0] = '\0';
+	catalog->setup.filters = NULL;
+	catalog->setup.splitTablesLargerThanBytes = 0;
+	catalog->setup.splitMaxParts = 0;
 
 	SQLiteQuery query = {
 		.context = &(catalog->setup),
@@ -2403,6 +2685,68 @@ catalog_add_s_matview(DatabaseCatalog *catalog, SourceTable *table)
 
 
 /*
+ * catalog_upsert_target_s_rel inserts or replaces a row in the target
+ * catalog's s_rel table (nspname, relname, relkind, ispopulated).
+ * Used to cache matviews ('m') and partitioned tables ('p') from the target.
+ */
+bool
+catalog_upsert_target_s_rel(DatabaseCatalog *catalog,
+							const char *nspname,
+							const char *relname,
+							char relkind,
+							bool ispopulated)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_upsert_target_s_rel: db is NULL");
+		return false;
+	}
+
+	char relkindStr[2] = { relkind, '\0' };
+
+	char *sql =
+		"insert into s_rel(nspname, relname, relkind, ispopulated)"
+		" values($1, $2, $3, $4)"
+		" on conflict(nspname, relname) do update"
+		"   set relkind = excluded.relkind,"
+		"       ispopulated = excluded.ispopulated";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, (char *) nspname },
+		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, (char *) relname },
+		{ BIND_PARAMETER_TYPE_TEXT, "relkind", 0, relkindStr },
+		{ BIND_PARAMETER_TYPE_INT, "ispopulated", ispopulated ? 1 : 0, NULL },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * catalog_lookup_s_matview_by_oid fetches a s_matview entry from catalog.
  */
 bool
@@ -2524,9 +2868,9 @@ catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table)
 
 	char *sql =
 		"insert into s_table("
-		"  oid, qname, nspname, relname, amname, restore_list_name, "
+		"  oid, datname, qname, nspname, relname, amname, restore_list_name, "
 		"  relpages, reltuples, exclude_data, part_key) "
-		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
 
 	SQLiteQuery query = { 0 };
 
@@ -2539,6 +2883,7 @@ catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table)
 	/* bind our parameters now */
 	BindParam params[] = {
 		{ BIND_PARAMETER_TYPE_INT64, "oid", table->oid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "datname", 0, table->datname },
 		{ BIND_PARAMETER_TYPE_TEXT, "qname", 0, table->qname },
 		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, table->nspname },
 		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, table->relname },
@@ -2575,38 +2920,71 @@ catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table)
 		return false;
 	}
 
-	/* now add the attributes */
-	if (!catalog_add_attributes(catalog, table))
-	{
-		log_error("Failed to add table %s attributes, see above for details",
-				  table->qname);
-		return false;
-	}
-
 	return true;
 }
 
 
 /*
- * catalog_add_attributes INSERTs a SourceTable attributes array to our
- * internal catalogs database (s_attr).
+ * catalog_add_s_attr INSERTs a single SourceTableAttribute into s_attr.
+ * Used when streaming attributes from the separate list_table_attributes query.
  */
 bool
-catalog_add_attributes(DatabaseCatalog *catalog, SourceTable *table)
+catalog_add_s_attr(DatabaseCatalog *catalog,
+				   uint32_t tableoid,
+				   SourceTableAttribute *attr)
 {
 	sqlite3 *db = catalog->db;
 
 	if (db == NULL)
 	{
-		log_error("BUG: catalog_add_attributes: db is NULL");
+		log_error("BUG: catalog_add_s_attr: db is NULL");
 		return false;
 	}
 
 	char *sql =
 		"insert into s_attr("
 		"oid, attnum, attypid, attname, "
-		"attisprimary, attisreplident, attisgenerated)"
-		"values($1, $2, $3, $4, $5, $6, $7)";
+		"attisprimary, attisreplident, attisgenerated, attidentity, "
+		"attisbinarycompatible, atttypsend)"
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+
+	/* store attidentity as a one-char string, or "" when not an identity col */
+	char identityStr[2] = { attr->attidentity, '\0' };
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", tableoid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "attnum", attr->attnum, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "atttypid", attr->atttypid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "attname", 0, attr->attname },
+
+		{
+			BIND_PARAMETER_TYPE_INT, "attisprimary",
+			attr->attisprimary ? 1 : 0, NULL
+		},
+
+		{
+			BIND_PARAMETER_TYPE_INT, "attisreplident",
+			attr->attisreplident ? 1 : 0, NULL
+		},
+
+		{
+			BIND_PARAMETER_TYPE_INT, "attisgenerated",
+			attr->attisgenerated ? 1 : 0, NULL
+		},
+
+		{ BIND_PARAMETER_TYPE_TEXT, "attidentity", 0, identityStr },
+
+		{
+			BIND_PARAMETER_TYPE_INT, "attisbinarycompatible",
+			attr->attisbinarycompatible ? 1 : 0, NULL
+		},
+
+		{
+			BIND_PARAMETER_TYPE_TEXT, "atttypsend", 0, attr->atttypsend
+		}
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
 
 	SQLiteQuery query = { 0 };
 
@@ -2616,56 +2994,102 @@ catalog_add_attributes(DatabaseCatalog *catalog, SourceTable *table)
 		return false;
 	}
 
-	for (int i = 0; i < table->attributes.count; i++)
+	if (!catalog_sql_bind(&query, params, count))
 	{
-		SourceTableAttribute *attr = &(table->attributes.array[i]);
-
-		BindParam params[] = {
-			{ BIND_PARAMETER_TYPE_INT64, "oid", table->oid, NULL },
-			{ BIND_PARAMETER_TYPE_INT64, "attnum", attr->attnum, NULL },
-			{ BIND_PARAMETER_TYPE_INT64, "atttypid", attr->atttypid, NULL },
-			{ BIND_PARAMETER_TYPE_TEXT, "attname", 0, attr->attname },
-
-			{
-				BIND_PARAMETER_TYPE_INT, "attisprimary",
-				attr->attisprimary ? 1 : 0, NULL
-			},
-
-			{
-				BIND_PARAMETER_TYPE_INT, "attisreplident",
-				attr->attisreplident ? 1 : 0, NULL
-			},
-
-			{
-				BIND_PARAMETER_TYPE_INT, "attisgenerated",
-				attr->attisgenerated ? 1 : 0, NULL
-			}
-		};
-
-		int count = sizeof(params) / sizeof(params[0]);
-
-		if (!catalog_sql_bind(&query, params, count))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		/* now execute the query, which does not return any row */
-		if (!catalog_sql_execute(&query))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		/* errors have already been logged */
+		return false;
 	}
 
-	/* and finalize the query */
-	if (!catalog_sql_finalize(&query))
+	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
 	return true;
+}
+
+
+/*
+ * catalog_s_table_oid_array builds a PostgreSQL array literal of all table
+ * OIDs stored in s_table, formatted as "{oid1,oid2,...}" for use as a $1
+ * text parameter with ::oid[] casting in SQL.  The caller must free *text.
+ */
+bool
+catalog_s_table_oid_array(DatabaseCatalog *catalog, char **text, int *count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_s_table_oid_array: db is NULL");
+		return false;
+	}
+
+	PQExpBufferData buf;
+	initPQExpBuffer(&buf);
+	appendPQExpBufferChar(&buf, '{');
+
+	*count = 0;
+
+	char *oidSql = "select oid from s_table order by oid";
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, oidSql, &query))
+	{
+		termPQExpBuffer(&buf);
+		return false;
+	}
+
+	for (;;)
+	{
+		int rc = catalog_sql_step(&query);
+
+		if (rc == SQLITE_DONE)
+		{
+			break;
+		}
+
+		if (rc != SQLITE_ROW)
+		{
+			log_error("[SQLite %d: %s]: %s",
+					  rc,
+					  query.sql,
+					  sqlite3_errmsg(db));
+			(void) catalog_sql_finalize(&query);
+			termPQExpBuffer(&buf);
+			return false;
+		}
+
+		if (*count > 0)
+		{
+			appendPQExpBufferChar(&buf, ',');
+		}
+
+		uint64_t oid = sqlite3_column_int64(query.ppStmt, 0);
+		appendPQExpBuffer(&buf, "%llu", (unsigned long long) oid);
+		++(*count);
+	}
+
+	if (!catalog_sql_finalize(&query))
+	{
+		termPQExpBuffer(&buf);
+		return false;
+	}
+
+	appendPQExpBufferChar(&buf, '}');
+
+	if (PQExpBufferBroken(&buf))
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		termPQExpBuffer(&buf);
+		return false;
+	}
+
+	*text = strdup(buf.data);
+	termPQExpBuffer(&buf);
+
+	return *text != NULL;
 }
 
 
@@ -3153,7 +3577,7 @@ catalog_lookup_s_table(DatabaseCatalog *catalog,
 	if (partNumber > 0)
 	{
 		char *sql =
-			"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+			"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 			"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 			"         exclude_data, part_key, "
 			"         p.partcount as partcount, p.partnum, p.min, p.max "
@@ -3189,7 +3613,7 @@ catalog_lookup_s_table(DatabaseCatalog *catalog,
 	else
 	{
 		char *sql =
-			"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+			"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 			"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 			"         exclude_data, part_key, "
 			"         count(p.oid) as partcount "
@@ -3251,7 +3675,7 @@ catalog_lookup_s_table_by_name(DatabaseCatalog *catalog,
 	}
 
 	char *sql =
-		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 		"         exclude_data, part_key, "
 		"         p.partcount, 0 as partnum, 0 as min, 0 as max "
@@ -3321,7 +3745,7 @@ catalog_lookup_s_attr_by_name(DatabaseCatalog *catalog,
 
 	char *sql =
 		"  select attnum, attypid, attname, "
-		"         attisprimary, attisreplident, attisgenerated "
+		"         attisprimary, attisreplident, attisgenerated, attidentity "
 		"    from s_attr "
 		"   where oid = $1 and attname = $2";
 
@@ -3494,7 +3918,7 @@ catalog_iter_s_table_init(SourceTableIterator *iter)
 	}
 
 	char *sql =
-		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 		"         exclude_data, part_key, "
 		"         coalesce(p.partcount, 0) as partcount, "
@@ -3549,7 +3973,7 @@ catalog_iter_s_table_nopk_init(SourceTableIterator *iter)
 	}
 
 	char *sql =
-		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 		"         exclude_data, part_key, "
 		"         (select count(1) from s_table_part p where p.oid = t.oid) "
@@ -3618,60 +4042,67 @@ catalog_s_table_fetch(SQLiteQuery *query)
 
 	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
 	{
-		strlcpy(table->qname,
+		strlcpy(table->datname,
 				(char *) sqlite3_column_text(query->ppStmt, 1),
-				sizeof(table->qname));
+				sizeof(table->datname));
 	}
 
 	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
 	{
-		strlcpy(table->nspname,
+		strlcpy(table->qname,
 				(char *) sqlite3_column_text(query->ppStmt, 2),
-				sizeof(table->nspname));
+				sizeof(table->qname));
 	}
 
 	if (sqlite3_column_type(query->ppStmt, 3) != SQLITE_NULL)
 	{
-		strlcpy(table->relname,
+		strlcpy(table->nspname,
 				(char *) sqlite3_column_text(query->ppStmt, 3),
-				sizeof(table->relname));
+				sizeof(table->nspname));
 	}
 
 	if (sqlite3_column_type(query->ppStmt, 4) != SQLITE_NULL)
 	{
-		strlcpy(table->amname,
+		strlcpy(table->relname,
 				(char *) sqlite3_column_text(query->ppStmt, 4),
-				sizeof(table->amname));
+				sizeof(table->relname));
 	}
 
 	if (sqlite3_column_type(query->ppStmt, 5) != SQLITE_NULL)
 	{
-		strlcpy(table->restoreListName,
+		strlcpy(table->amname,
 				(char *) sqlite3_column_text(query->ppStmt, 5),
+				sizeof(table->amname));
+	}
+
+	if (sqlite3_column_type(query->ppStmt, 6) != SQLITE_NULL)
+	{
+		strlcpy(table->restoreListName,
+				(char *) sqlite3_column_text(query->ppStmt, 6),
 				sizeof(table->restoreListName));
 	}
 
-	table->relpages = sqlite3_column_int64(query->ppStmt, 6);
-	table->reltuples = sqlite3_column_int64(query->ppStmt, 7);
-	table->bytes = sqlite3_column_int64(query->ppStmt, 8);
+	table->relpages = sqlite3_column_int64(query->ppStmt, 7);
+	table->reltuples = sqlite3_column_int64(query->ppStmt, 8);
+	table->bytes = sqlite3_column_int64(query->ppStmt, 9);
 
-	if (sqlite3_column_type(query->ppStmt, 9) != SQLITE_NULL)
+	if (sqlite3_column_type(query->ppStmt, 10) != SQLITE_NULL)
 	{
 		strlcpy(table->bytesPretty,
-				(char *) sqlite3_column_text(query->ppStmt, 9),
+				(char *) sqlite3_column_text(query->ppStmt, 10),
 				sizeof(table->bytesPretty));
 	}
 
-	table->excludeData = sqlite3_column_int64(query->ppStmt, 10) == 1;
+	table->excludeData = sqlite3_column_int64(query->ppStmt, 11) == 1;
 
-	if (sqlite3_column_type(query->ppStmt, 11) != SQLITE_NULL)
+	if (sqlite3_column_type(query->ppStmt, 12) != SQLITE_NULL)
 	{
 		strlcpy(table->partKey,
-				(char *) sqlite3_column_text(query->ppStmt, 11),
+				(char *) sqlite3_column_text(query->ppStmt, 12),
 				sizeof(table->partKey));
 	}
 
-	table->partition.partCount = sqlite3_column_int64(query->ppStmt, 12);
+	table->partition.partCount = sqlite3_column_int64(query->ppStmt, 13);
 
 	/*
 	 * The main iterator query returns partition count, whereas the catalog
@@ -3681,42 +4112,42 @@ catalog_s_table_fetch(SQLiteQuery *query)
 	int cols = sqlite3_column_count(query->ppStmt);
 
 	/* partition information from s_table_part */
-	if (cols >= 16)
+	if (cols >= 17)
 	{
-		table->partition.partNumber = sqlite3_column_int64(query->ppStmt, 13);
-		table->partition.min = sqlite3_column_int64(query->ppStmt, 14);
-		table->partition.max = sqlite3_column_int64(query->ppStmt, 15);
+		table->partition.partNumber = sqlite3_column_int64(query->ppStmt, 14);
+		table->partition.min = sqlite3_column_int64(query->ppStmt, 15);
+		table->partition.max = sqlite3_column_int64(query->ppStmt, 16);
 	}
 
 	/* checksum information from s_table_chksum */
-	if (cols >= 20)
+	if (cols >= 21)
 	{
 		table->sourceChecksum.rowcount =
-			sqlite3_column_int64(query->ppStmt, 16);
+			sqlite3_column_int64(query->ppStmt, 17);
 
-		if (sqlite3_column_type(query->ppStmt, 17) != SQLITE_NULL)
+		if (sqlite3_column_type(query->ppStmt, 18) != SQLITE_NULL)
 		{
 			strlcpy(table->sourceChecksum.checksum,
-					(char *) sqlite3_column_text(query->ppStmt, 17),
+					(char *) sqlite3_column_text(query->ppStmt, 18),
 					sizeof(table->sourceChecksum.checksum));
 		}
 
 		table->targetChecksum.rowcount =
-			sqlite3_column_int64(query->ppStmt, 18);
+			sqlite3_column_int64(query->ppStmt, 19);
 
-		if (sqlite3_column_type(query->ppStmt, 19) != SQLITE_NULL)
+		if (sqlite3_column_type(query->ppStmt, 20) != SQLITE_NULL)
 		{
 			strlcpy(table->targetChecksum.checksum,
-					(char *) sqlite3_column_text(query->ppStmt, 19),
+					(char *) sqlite3_column_text(query->ppStmt, 20),
 					sizeof(table->targetChecksum.checksum));
 		}
 	}
 
 	/* summary information from s_table_parts_done */
-	if (cols == 22)
+	if (cols == 23)
 	{
-		table->durationMs = sqlite3_column_int64(query->ppStmt, 20);
-		table->bytesTransmitted = sqlite3_column_int64(query->ppStmt, 21);
+		table->durationMs = sqlite3_column_int64(query->ppStmt, 21);
+		table->bytesTransmitted = sqlite3_column_int64(query->ppStmt, 22);
 	}
 
 	return true;
@@ -4013,6 +4444,69 @@ catalog_s_table_fetch_attrlist(SQLiteQuery *query)
 
 
 /*
+ * catalog_s_table_all_binary_compatible returns true in *allCompatible when
+ * every column of the given table has attisbinarycompatible = 1 in s_attr.
+ * Returns false when any column's type has a send function known to produce
+ * alignment-unsafe binary output (i.e., the column is on the blocklist).
+ */
+bool
+catalog_s_table_all_binary_compatible(DatabaseCatalog *catalog,
+									  SourceTable *table,
+									  bool *allCompatible)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_s_table_all_binary_compatible: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"select count(*) from s_attr "
+		" where oid = $1 and attisbinarycompatible = 0";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", table->oid, NULL }
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	int rc = catalog_sql_step(&query);
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("[SQLite %d: %s]: %s", rc, query.sql, sqlite3_errmsg(db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	int incompatCount = sqlite3_column_int(query.ppStmt, 0);
+
+	if (!catalog_sql_finalize(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	*allCompatible = (incompatCount == 0);
+	return true;
+}
+
+
+/*
  * catalog_s_table_fetch_attrs fetches the table SourceTableAttribute array
  * from our s_attr catalog.
  */
@@ -4085,7 +4579,7 @@ catalog_iter_s_table_attrs_init(SourceTableAttrsIterator *iter)
 		"  select count(*) over(order by attnum) as num, "
 		"         count(*) over() as count, "
 		"         attnum, attypid, attname, "
-		"         attisprimary, attisreplident, attisgenerated "
+		"         attisprimary, attisreplident, attisgenerated, attidentity "
 		"    from s_attr "
 		"   where oid = $1 "
 		"order by attnum";
@@ -4201,6 +4695,9 @@ catalog_s_table_attrs_fetch(SQLiteQuery *query)
 	attr->attisreplident = sqlite3_column_int(query->ppStmt, 6) == 1;
 	attr->attisgenerated = sqlite3_column_int(query->ppStmt, 7) == 1;
 
+	const char *identity = (const char *) sqlite3_column_text(query->ppStmt, 8);
+	attr->attidentity = (identity != NULL && identity[0] != '\0') ? identity[0] : '\0';
+
 	return true;
 }
 
@@ -4223,6 +4720,9 @@ catalog_s_attr_fetch(SQLiteQuery *query)
 	attr->attisprimary = sqlite3_column_int(query->ppStmt, 3) == 1;
 	attr->attisreplident = sqlite3_column_int(query->ppStmt, 4) == 1;
 	attr->attisgenerated = sqlite3_column_int(query->ppStmt, 5) == 1;
+
+	const char *identity = (const char *) sqlite3_column_text(query->ppStmt, 6);
+	attr->attidentity = (identity != NULL && identity[0] != '\0') ? identity[0] : '\0';
 
 	return true;
 }
@@ -4355,6 +4855,501 @@ catalog_add_s_constraint(DatabaseCatalog *catalog, SourceIndex *index)
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_add_s_table_batch INSERTs multiple SourceTable rows in one
+ * multi-row VALUES statement.  Batch size is bounded by SQLite's
+ * SQLITE_LIMIT_VARIABLE_NUMBER so that the total parameter count never
+ * exceeds the compile-time limit.
+ */
+bool
+catalog_add_s_table_batch(DatabaseCatalog *catalog, SourceTable *tables, int count)
+{
+	if (count <= 0)
+	{
+		return true;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_table_batch: db is NULL");
+		return false;
+	}
+
+	int maxVars = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+	int batchSize = maxVars / CATALOG_INSERT_NCOLS_S_TABLE;
+
+	for (int offset = 0; offset < count; offset += batchSize)
+	{
+		int rows = count - offset;
+
+		if (rows > batchSize)
+		{
+			rows = batchSize;
+		}
+
+		PQExpBufferData buf;
+		initPQExpBuffer(&buf);
+
+		appendPQExpBufferStr(&buf,
+							 "insert into s_table("
+							 "oid, datname, qname, nspname, relname, amname, "
+							 "restore_list_name, relpages, reltuples, "
+							 "exclude_data, part_key) values");
+
+		int paramIdx = 1;
+
+		for (int r = 0; r < rows; r++)
+		{
+			appendPQExpBuffer(&buf,
+							  "%s(?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d)",
+							  r == 0 ? "" : ",",
+							  paramIdx, paramIdx + 1, paramIdx + 2,
+							  paramIdx + 3, paramIdx + 4, paramIdx + 5,
+							  paramIdx + 6, paramIdx + 7, paramIdx + 8,
+							  paramIdx + 9, paramIdx + 10);
+			paramIdx += CATALOG_INSERT_NCOLS_S_TABLE;
+		}
+
+		if (PQExpBufferBroken(&buf))
+		{
+			log_error("Failed to build batch INSERT for s_table: out of memory");
+			termPQExpBuffer(&buf);
+			return false;
+		}
+
+		sqlite3_stmt *stmt = NULL;
+		int rc = sqlite3_prepare_v2(db, buf.data, -1, &stmt, NULL);
+
+		termPQExpBuffer(&buf);
+
+		if (rc != SQLITE_OK)
+		{
+			log_error("Failed to prepare batch INSERT for s_table: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+
+		for (int r = 0; r < rows; r++)
+		{
+			SourceTable *t = &tables[offset + r];
+			int base = r * CATALOG_INSERT_NCOLS_S_TABLE + 1;
+
+			sqlite3_bind_int64(stmt, base + 0, t->oid);
+			sqlite3_bind_text(stmt, base + 1, t->datname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 2, t->qname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 3, t->nspname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 4, t->relname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 5, t->amname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 6, t->restoreListName, -1, SQLITE_STATIC);
+			sqlite3_bind_int64(stmt, base + 7, t->relpages);
+			sqlite3_bind_int64(stmt, base + 8, t->reltuples);
+			sqlite3_bind_int(stmt, base + 9, t->excludeData ? 1 : 0);
+			sqlite3_bind_text(stmt, base + 10, t->partKey, -1, SQLITE_STATIC);
+		}
+
+		rc = sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+
+		if (rc != SQLITE_DONE)
+		{
+			log_error("Failed to execute batch INSERT for s_table: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_add_s_attr_batch INSERTs multiple SourceTableAttribute rows in one
+ * multi-row VALUES statement.
+ */
+bool
+catalog_add_s_attr_batch(DatabaseCatalog *catalog,
+						 uint32_t *tableoids,
+						 SourceTableAttribute *attrs,
+						 int count)
+{
+	if (count <= 0)
+	{
+		return true;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_attr_batch: db is NULL");
+		return false;
+	}
+
+	int maxVars = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+	int batchSize = maxVars / CATALOG_INSERT_NCOLS_S_ATTR;
+
+	for (int offset = 0; offset < count; offset += batchSize)
+	{
+		int rows = count - offset;
+
+		if (rows > batchSize)
+		{
+			rows = batchSize;
+		}
+
+		PQExpBufferData buf;
+		initPQExpBuffer(&buf);
+
+		appendPQExpBufferStr(&buf,
+							 "insert into s_attr("
+							 "oid, attnum, attypid, attname, "
+							 "attisprimary, attisreplident, attisgenerated, "
+							 "attidentity, attisbinarycompatible, atttypsend) values");
+
+		int paramIdx = 1;
+
+		for (int r = 0; r < rows; r++)
+		{
+			appendPQExpBuffer(&buf,
+							  "%s(?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d)",
+							  r == 0 ? "" : ",",
+							  paramIdx, paramIdx + 1, paramIdx + 2,
+							  paramIdx + 3, paramIdx + 4, paramIdx + 5,
+							  paramIdx + 6, paramIdx + 7, paramIdx + 8,
+							  paramIdx + 9);
+			paramIdx += CATALOG_INSERT_NCOLS_S_ATTR;
+		}
+
+		if (PQExpBufferBroken(&buf))
+		{
+			log_error("Failed to build batch INSERT for s_attr: out of memory");
+			termPQExpBuffer(&buf);
+			return false;
+		}
+
+		sqlite3_stmt *stmt = NULL;
+		int rc = sqlite3_prepare_v2(db, buf.data, -1, &stmt, NULL);
+
+		termPQExpBuffer(&buf);
+
+		if (rc != SQLITE_OK)
+		{
+			log_error("Failed to prepare batch INSERT for s_attr: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+
+		/*
+		 * attidentity is stored as a one-char string.  We need a stable
+		 * char[2] buffer for each row; use a local VLA-style stack array.
+		 * The maximum batch size is bounded by SQLITE_LIMIT_VARIABLE_NUMBER
+		 * (32766) / 10 ≈ 3276 rows per batch — a reasonable stack footprint.
+		 */
+		char (*identBufs)[2] = malloc(rows * sizeof(char[2]));
+
+		if (identBufs == NULL)
+		{
+			log_error("Failed to allocate identity buffer in catalog_add_s_attr_batch");
+			sqlite3_finalize(stmt);
+			return false;
+		}
+
+		for (int r = 0; r < rows; r++)
+		{
+			SourceTableAttribute *a = &attrs[offset + r];
+			int base = r * CATALOG_INSERT_NCOLS_S_ATTR + 1;
+
+			identBufs[r][0] = a->attidentity;
+			identBufs[r][1] = '\0';
+
+			sqlite3_bind_int64(stmt, base + 0, tableoids[offset + r]);
+			sqlite3_bind_int64(stmt, base + 1, a->attnum);
+			sqlite3_bind_int64(stmt, base + 2, a->atttypid);
+			sqlite3_bind_text(stmt, base + 3, a->attname, -1, SQLITE_STATIC);
+			sqlite3_bind_int(stmt, base + 4, a->attisprimary ? 1 : 0);
+			sqlite3_bind_int(stmt, base + 5, a->attisreplident ? 1 : 0);
+			sqlite3_bind_int(stmt, base + 6, a->attisgenerated ? 1 : 0);
+			sqlite3_bind_text(stmt, base + 7, identBufs[r], -1, SQLITE_STATIC);
+			sqlite3_bind_int(stmt, base + 8, a->attisbinarycompatible ? 1 : 0);
+			sqlite3_bind_text(stmt, base + 9, a->atttypsend, -1, SQLITE_STATIC);
+		}
+
+		rc = sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+		free(identBufs);
+
+		if (rc != SQLITE_DONE)
+		{
+			log_error("Failed to execute batch INSERT for s_attr: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_add_s_index_batch INSERTs multiple SourceIndex rows into s_index in
+ * one multi-row VALUES statement.
+ */
+bool
+catalog_add_s_index_batch(DatabaseCatalog *catalog,
+						  SourceIndex *indexes,
+						  int count)
+{
+	if (count <= 0)
+	{
+		return true;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_index_batch: db is NULL");
+		return false;
+	}
+
+	int maxVars = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+	int batchSize = maxVars / CATALOG_INSERT_NCOLS_S_INDEX;
+
+	for (int offset = 0; offset < count; offset += batchSize)
+	{
+		int rows = count - offset;
+
+		if (rows > batchSize)
+		{
+			rows = batchSize;
+		}
+
+		PQExpBufferData buf;
+		initPQExpBuffer(&buf);
+
+		appendPQExpBufferStr(&buf,
+							 "insert into s_index("
+							 "oid, qname, nspname, relname, restore_list_name, "
+							 "tableoid, isprimary, isunique, columns, sql) values");
+
+		int paramIdx = 1;
+
+		for (int r = 0; r < rows; r++)
+		{
+			appendPQExpBuffer(&buf,
+							  "%s(?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d,?%d)",
+							  r == 0 ? "" : ",",
+							  paramIdx, paramIdx + 1, paramIdx + 2,
+							  paramIdx + 3, paramIdx + 4, paramIdx + 5,
+							  paramIdx + 6, paramIdx + 7, paramIdx + 8,
+							  paramIdx + 9);
+			paramIdx += CATALOG_INSERT_NCOLS_S_INDEX;
+		}
+
+		if (PQExpBufferBroken(&buf))
+		{
+			log_error("Failed to build batch INSERT for s_index: out of memory");
+			termPQExpBuffer(&buf);
+			return false;
+		}
+
+		sqlite3_stmt *stmt = NULL;
+		int rc = sqlite3_prepare_v2(db, buf.data, -1, &stmt, NULL);
+
+		termPQExpBuffer(&buf);
+
+		if (rc != SQLITE_OK)
+		{
+			log_error("Failed to prepare batch INSERT for s_index: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+
+		for (int r = 0; r < rows; r++)
+		{
+			SourceIndex *idx = &indexes[offset + r];
+			int base = r * CATALOG_INSERT_NCOLS_S_INDEX + 1;
+
+			sqlite3_bind_int64(stmt, base + 0, idx->indexOid);
+			sqlite3_bind_text(stmt, base + 1, idx->indexQname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 2, idx->indexNamespace, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 3, idx->indexRelname, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 4,
+							  idx->indexRestoreListName, -1, SQLITE_STATIC);
+			sqlite3_bind_int64(stmt, base + 5, idx->tableOid);
+			sqlite3_bind_int(stmt, base + 6, idx->isPrimary ? 1 : 0);
+			sqlite3_bind_int(stmt, base + 7, idx->isUnique ? 1 : 0);
+			sqlite3_bind_text(stmt, base + 8, idx->indexColumns, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, base + 9, idx->indexDef, -1, SQLITE_STATIC);
+		}
+
+		rc = sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+
+		if (rc != SQLITE_DONE)
+		{
+			log_error("Failed to execute batch INSERT for s_index: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_add_s_constraint_batch INSERTs multiple SourceIndex constraint rows
+ * into s_constraint in one multi-row VALUES statement.  Only rows where
+ * constraintOid != 0 are inserted (not all indexes have a constraint).
+ */
+bool
+catalog_add_s_constraint_batch(DatabaseCatalog *catalog,
+							   SourceIndex *indexes,
+							   int count)
+{
+	if (count <= 0)
+	{
+		return true;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_constraint_batch: db is NULL");
+		return false;
+	}
+
+	/* count how many have a constraint */
+	int conCount = 0;
+
+	for (int i = 0; i < count; i++)
+	{
+		if (indexes[i].constraintOid != 0)
+		{
+			conCount++;
+		}
+	}
+
+	if (conCount == 0)
+	{
+		return true;
+	}
+
+	int maxVars = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+	int batchSize = maxVars / CATALOG_INSERT_NCOLS_S_CONSTRAINT;
+
+	/* iterate over the original array but skip non-constraint entries */
+	int conOffset = 0;
+
+	while (conOffset < conCount)
+	{
+		int rows = conCount - conOffset;
+
+		if (rows > batchSize)
+		{
+			rows = batchSize;
+		}
+
+		PQExpBufferData buf;
+		initPQExpBuffer(&buf);
+
+		appendPQExpBufferStr(&buf,
+							 "insert into s_constraint("
+							 "oid, conname, indexoid, "
+							 "condeferrable, condeferred, sql) values");
+
+		int paramIdx = 1;
+
+		for (int r = 0; r < rows; r++)
+		{
+			appendPQExpBuffer(&buf,
+							  "%s(?%d,?%d,?%d,?%d,?%d,?%d)",
+							  r == 0 ? "" : ",",
+							  paramIdx, paramIdx + 1, paramIdx + 2,
+							  paramIdx + 3, paramIdx + 4, paramIdx + 5);
+			paramIdx += CATALOG_INSERT_NCOLS_S_CONSTRAINT;
+		}
+
+		if (PQExpBufferBroken(&buf))
+		{
+			log_error("Failed to build batch INSERT for s_constraint: out of memory");
+			termPQExpBuffer(&buf);
+			return false;
+		}
+
+		sqlite3_stmt *stmt = NULL;
+		int rc = sqlite3_prepare_v2(db, buf.data, -1, &stmt, NULL);
+
+		termPQExpBuffer(&buf);
+
+		if (rc != SQLITE_OK)
+		{
+			log_error("Failed to prepare batch INSERT for s_constraint: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+
+		/* walk the original array, binding only constraint-bearing entries */
+		int r = 0;
+		int srcIdx = 0;
+		int skipped = 0;  /* how many constraint rows we've already emitted */
+
+		while (r < rows)
+		{
+			if (srcIdx >= count)
+			{
+				break;
+			}
+
+			SourceIndex *idx = &indexes[srcIdx++];
+
+			if (idx->constraintOid == 0)
+			{
+				continue;
+			}
+
+			/* skip rows already emitted in prior batches */
+			if (skipped < conOffset)
+			{
+				skipped++;
+				continue;
+			}
+
+			int base = r * CATALOG_INSERT_NCOLS_S_CONSTRAINT + 1;
+
+			sqlite3_bind_int64(stmt, base + 0, idx->constraintOid);
+			sqlite3_bind_text(stmt, base + 1,
+							  idx->constraintName, -1, SQLITE_STATIC);
+			sqlite3_bind_int64(stmt, base + 2, idx->indexOid);
+			sqlite3_bind_int(stmt, base + 3, idx->condeferrable ? 1 : 0);
+			sqlite3_bind_int(stmt, base + 4, idx->condeferred ? 1 : 0);
+			sqlite3_bind_text(stmt, base + 5,
+							  idx->constraintDef, -1, SQLITE_STATIC);
+
+			r++;
+		}
+
+		rc = sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+
+		if (rc != SQLITE_DONE)
+		{
+			log_error("Failed to execute batch INSERT for s_constraint: %s",
+					  sqlite3_errmsg(db));
+			return false;
+		}
+
+		conOffset += rows;
 	}
 
 	return true;
@@ -4925,15 +5920,13 @@ catalog_iter_s_index_finish(SourceIndexIterator *iter)
 bool
 catalog_s_table_count_indexes(DatabaseCatalog *catalog, SourceTable *table)
 {
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
+	if (catalog->db == NULL)
 	{
 		log_error("BUG: catalog_s_table_count_indexes: db is NULL");
 		return false;
 	}
 
-	char *sql =
+	static const char *sql =
 		"select count(1) as indexes, "
 		"       count(c.oid) as constraints "
 		"  from s_index i "
@@ -4951,7 +5944,7 @@ catalog_s_table_count_indexes(DatabaseCatalog *catalog, SourceTable *table)
 		.fetchFunction = &catalog_s_table_count_indexes_fetch
 	};
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		(void) semaphore_unlock(&(catalog->sema));
@@ -5052,8 +6045,8 @@ catalog_add_s_seq(DatabaseCatalog *catalog, SourceSequence *seq)
 	char *sql =
 		"insert into s_seq("
 		"  oid, ownedby, attrelid, attroid, "
-		"  qname, nspname, relname, restore_list_name)"
-		"values($1, $2, $3, $4, $5, $6, $7, $8)";
+		"  datname, qname, nspname, relname, restore_list_name)"
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9)";
 
 	SQLiteQuery query = { 0 };
 
@@ -5070,6 +6063,7 @@ catalog_add_s_seq(DatabaseCatalog *catalog, SourceSequence *seq)
 		{ BIND_PARAMETER_TYPE_INT64, "attrelid", seq->attrelid, NULL },
 		{ BIND_PARAMETER_TYPE_INT64, "attroid", seq->attroid, NULL },
 
+		{ BIND_PARAMETER_TYPE_TEXT, "datname", 0, seq->datname },
 		{ BIND_PARAMETER_TYPE_TEXT, "qname", 0, seq->qname },
 		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, seq->nspname },
 		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, seq->relname },
@@ -5225,7 +6219,7 @@ catalog_lookup_s_seq_by_name(DatabaseCatalog *catalog,
 
 	char *sql =
 		"  select oid, ownedby, attrelid, attroid, "
-		"         qname, nspname, relname, restore_list_name, "
+		"         datname, qname, nspname, relname, restore_list_name, "
 		"         last_value, isCalled "
 		"    from s_seq "
 		"   where nspname = $1 and relname = $2 ";
@@ -5345,7 +6339,7 @@ catalog_iter_s_seq_init(SourceSeqIterator *iter)
 
 	char *sql =
 		"  select oid, ownedby, attrelid, attroid, "
-		"         qname, nspname, relname, restore_list_name, "
+		"         datname, qname, nspname, relname, restore_list_name, "
 		"         last_value, isCalled "
 		"    from s_seq "
 		"order by nspname, relname";
@@ -5410,24 +6404,31 @@ catalog_s_seq_fetch(SQLiteQuery *query)
 	seq->attrelid = sqlite3_column_int64(query->ppStmt, 2);
 	seq->attroid = sqlite3_column_int64(query->ppStmt, 3);
 
+	if (sqlite3_column_type(query->ppStmt, 4) != SQLITE_NULL)
+	{
+		strlcpy(seq->datname,
+				(char *) sqlite3_column_text(query->ppStmt, 4),
+				sizeof(seq->datname));
+	}
+
 	strlcpy(seq->qname,
-			(char *) sqlite3_column_text(query->ppStmt, 4),
+			(char *) sqlite3_column_text(query->ppStmt, 5),
 			sizeof(seq->qname));
 
 	strlcpy(seq->nspname,
-			(char *) sqlite3_column_text(query->ppStmt, 5),
+			(char *) sqlite3_column_text(query->ppStmt, 6),
 			sizeof(seq->nspname));
 
 	strlcpy(seq->relname,
-			(char *) sqlite3_column_text(query->ppStmt, 6),
+			(char *) sqlite3_column_text(query->ppStmt, 7),
 			sizeof(seq->relname));
 
 	strlcpy(seq->restoreListName,
-			(char *) sqlite3_column_text(query->ppStmt, 7),
+			(char *) sqlite3_column_text(query->ppStmt, 8),
 			sizeof(seq->restoreListName));
 
-	seq->lastValue = sqlite3_column_int64(query->ppStmt, 8);
-	seq->isCalled = sqlite3_column_int(query->ppStmt, 9);
+	seq->lastValue = sqlite3_column_int64(query->ppStmt, 9);
+	seq->isCalled = sqlite3_column_int(query->ppStmt, 10);
 
 	return true;
 }
@@ -5459,6 +6460,180 @@ catalog_iter_s_seq_finish(SourceSeqIterator *iter)
 
 
 /*
+ * catalog_add_catname INSERTs a (oid, catname) row into the catnames table.
+ */
+bool
+catalog_add_catname(DatabaseCatalog *catalog, uint32_t oid, const char *catname)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_catname: db is NULL");
+		return false;
+	}
+
+	char *sql = "insert or ignore into catnames(oid, catname) values($1, $2)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "catname", 0, (char *) catname },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+typedef struct CatNamesContext
+{
+	DatabaseCatalog *catalog;
+	bool parsedOk;
+} CatNamesContext;
+
+
+static void
+getCatNamesList(void *ctx, PGresult *result)
+{
+	CatNamesContext *context = (CatNamesContext *) ctx;
+	int nTuples = PQntuples(result);
+
+	if (PQnfields(result) != 2)
+	{
+		log_error("Query returned %d columns, expected 2", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	int errors = 0;
+
+	for (int rowNumber = 0; rowNumber < nTuples; rowNumber++)
+	{
+		uint32_t oid = 0;
+		char *value = PQgetvalue(result, rowNumber, 0);
+
+		if (!stringToUInt32(value, &oid) || oid == 0)
+		{
+			log_error("Invalid catalog OID \"%s\"", value);
+			++errors;
+			continue;
+		}
+
+		char *catname = PQgetvalue(result, rowNumber, 1);
+
+		if (!catalog_add_catname(context->catalog, oid, catname))
+		{
+			++errors;
+		}
+	}
+
+	context->parsedOk = (errors == 0);
+}
+
+
+/*
+ * catalog_fetch_catnames queries PostgreSQL for the OIDs of the system catalog
+ * tables that pgcopydb uses as filter namespace identifiers (catoid), then
+ * stores the (oid, catname) pairs in the catnames table of filterDB.
+ *
+ * This must be called before catalog_prepare_filter() so that the catnames
+ * subqueries inside the filter INSERT SQL resolve correctly.
+ */
+bool
+catalog_fetch_catnames(DatabaseCatalog *filterDB, PGSQL *pgsql)
+{
+	CatNamesContext context = { filterDB, false };
+
+	char *sql =
+		"  select c.oid, c.relname "
+		"    from pg_catalog.pg_class c "
+		"    join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+		"   where n.nspname = 'pg_catalog' "
+		"     and c.relname in ('pg_class', 'pg_constraint', 'pg_attrdef', "
+		"                       'pg_extension', 'pg_collation')";
+
+	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
+								   &context, &getCatNamesList))
+	{
+		log_error("Failed to fetch catalog namespace OIDs for filter catnames table");
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to fetch catalog namespace OIDs for filter catnames table");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_add_extension_filter stores one entry from [exclude-extension] or
+ * [include-only-extension] in the filter catalog's extension_filter table.
+ * catalog_prepare_filter reads this table instead of accepting the C lists
+ * as parameters, keeping its signature stable.
+ */
+bool
+catalog_add_extension_filter(DatabaseCatalog *catalog,
+							 const char *extname,
+							 const char *action)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_extension_filter: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into extension_filter(extname, action) "
+		"values ($1, $2)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	BindParam params[2] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "extname", 0, (char *) extname },
+		{ BIND_PARAMETER_TYPE_TEXT, "action", 0, (char *) action }
+	};
+
+	if (!catalog_sql_bind(&query, params, 2))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return catalog_sql_execute_once(&query);
+}
+
+
+/*
  * catalog_prepare_filter prepares our filter Hash-Table, that used to be an
  * in-memory only thing, and now is a SQLite table with indexes, so that it can
  * spill to disk when we have giant database catalogs to take care of.
@@ -5477,9 +6652,10 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	}
 
 	char *sql =
-		"insert into filter(oid, restore_list_name, kind) "
+		"insert into filter(catoid, oid, restore_list_name, kind) "
 
-		"     select oid, restore_list_name, 'table' "
+		"     select (select oid from catnames where catname = 'pg_class'),"
+		"            oid, restore_list_name, 'table' "
 		"       from s_table "
 
 		/*
@@ -5489,27 +6665,30 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 		 */
 		"  union all "
 
-		"	 select oid, restore_list_name, 'matview' "
+		"	 select (select oid from catnames where catname = 'pg_class'),"
+		"            oid, restore_list_name, 'matview' "
 		"	   from s_matview"
 
 		"  union all "
 
-		"     select oid, restore_list_name, 'index' "
+		"     select (select oid from catnames where catname = 'pg_class'),"
+		"            oid, restore_list_name, 'index' "
 		"       from s_index "
 
 		"  union all "
 
 		/* at the moment we lack restore names for constraints */
-		"     select oid, NULL as restore_list_name, 'constraint' "
+		"     select (select oid from catnames where catname = 'pg_constraint'),"
+		"            oid, NULL as restore_list_name, 'constraint' "
 		"       from s_constraint "
 
 		/*
 		 * Filtering-out sequences works with the following 3 Archive Catalog
 		 * entry kinds:
 		 *
-		 *  - SEQUENCE, matched by sequence oid
+		 *  - SEQUENCE, matched by sequence oid (pg_class namespace)
 		 *  - SEQUENCE OWNED BY, matched by sequence restore name
-		 *  - DEFAULT, matched by attribute oid
+		 *  - DEFAULT, matched by attroid (pg_attrdef namespace)
 		 *
 		 * In some cases we want to create the sequence, but we might want to
 		 * skip the SEQUENCE OWNED BY statement, because we didn't actually
@@ -5528,7 +6707,9 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 		 * still create it and refrain to add the sequence Oid to our hash
 		 * table here.
 		 */
-		"     select distinct s.oid, NULL as restore_list_name, 'sequence' "
+		"     select distinct "
+		"            (select oid from catnames where catname = 'pg_class'),"
+		"            s.oid, NULL as restore_list_name, 'sequence' "
 		"       from s_seq s "
 		"      where not exists"
 		"            (select 1 from source.s_seq ss where ss.oid = s.oid)"
@@ -5539,7 +6720,8 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 		 */
 		"  union all "
 
-		"     select NULL as oid, restore_list_name, 'sequence owned by' "
+		"     select (select oid from catnames where catname = 'pg_class'),"
+		"            NULL as oid, restore_list_name, 'sequence owned by' "
 		"       from ( "
 		"              select distinct s.restore_list_name "
 		"                from s_seq s "
@@ -5554,13 +6736,16 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 		"            ) as seqownedby "
 
 		/*
-		 * Also add pg_attribute.oid when it's not null (non-zero here). This
-		 * takes care of the DEFAULT entries in the pg_dump Archive Catalog,
-		 * and these entries target the attroid directly.
+		 * Also add attroid when it's not null (non-zero here). This takes care
+		 * of the DEFAULT entries in the pg_dump Archive Catalog; pg_dump emits
+		 * the pg_attrdef OID as the catalogId for these entries, so we store
+		 * attroid under the pg_attrdef catalog namespace.
 		 */
 		"  union all "
 
-		"     select distinct s.attroid, s.restore_list_name, 'default' "
+		"     select distinct "
+		"            (select oid from catnames where catname = 'pg_attrdef'),"
+		"            s.attroid, s.restore_list_name, 'default' "
 		"       from s_seq s "
 		"      where s.attroid > 0";
 
@@ -5584,8 +6769,8 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	 * in our hash table here. See the previous discussion for details.
 	 */
 	char *s_depend_sql =
-		"insert or ignore into filter(oid, restore_list_name, kind) "
-		"     select distinct objid, identity as restore_list_name, 'pg_depend' "
+		"insert or ignore into filter(catoid, oid, restore_list_name, kind) "
+		"     select distinct classid, objid, identity as restore_list_name, 'pg_depend' "
 		"       from s_depend d "
 		"      where not exists"
 		"            (select 1 from source.s_seq ss where ss.oid = d.objid) ";
@@ -5609,8 +6794,9 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	if (skipExtensions)
 	{
 		char *s_extension_sql =
-			"insert or ignore into filter(oid, restore_list_name, kind) "
-			"     select oid, extname, 'extension' "
+			"insert or ignore into filter(catoid, oid, restore_list_name, kind) "
+			"     select (select oid from catnames where catname = 'pg_extension'),"
+			"            oid, extname, 'extension' "
 			"       from s_extension ";
 
 		if (!catalog_sql_prepare(db, s_extension_sql, &query))
@@ -5628,13 +6814,90 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	}
 
 	/*
+	 * Implement [exclude-extension]: join s_extension against
+	 * extension_filter (action = 'exclude') to insert named extensions into
+	 * the filter table so that copydb_objectid_is_filtered_out skips their
+	 * TOC entries during the pg_restore list pass.
+	 */
+	char *s_excl_ext_sql =
+		"insert or ignore into filter(catoid, oid, restore_list_name, kind) "
+		"     select (select oid from catnames where catname = 'pg_extension'),"
+		"            e.oid, e.extname, 'extension' "
+		"       from s_extension e "
+		"      where exists "
+		"            (select 1 from extension_filter ef "
+		"              where ef.extname = e.extname "
+		"                and ef.action = 'exclude')";
+
+	if (!catalog_sql_prepare(db, s_excl_ext_sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Implement [include-only-extension]: insert ALL extensions into the
+	 * filter table, then remove the ones listed in extension_filter (action =
+	 * 'include-only'), so that only the non-listed extensions remain in the
+	 * filter and are therefore excluded from the copy.
+	 */
+	char *s_all_ext_sql =
+		"insert or ignore into filter(catoid, oid, restore_list_name, kind) "
+		"     select (select oid from catnames where catname = 'pg_extension'),"
+		"            e.oid, e.extname, 'extension' "
+		"       from s_extension e "
+		"      where (select count(*) from extension_filter "
+		"              where action = 'include-only') > 0";
+
+	if (!catalog_sql_prepare(db, s_all_ext_sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char *s_keep_ext_sql =
+		"delete from filter "
+		" where catoid = (select oid from catnames "
+		"                  where catname = 'pg_extension') "
+		"   and kind = 'extension' "
+		"   and exists "
+		"       (select 1 from extension_filter ef "
+		"         where ef.extname = filter.restore_list_name "
+		"           and ef.action = 'include-only')";
+
+	if (!catalog_sql_prepare(db, s_keep_ext_sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
 	 * Implement --skip-collations
 	 */
 	if (skipCollations)
 	{
 		char *s_coll_sql =
-			"insert or ignore into filter(oid, restore_list_name, kind) "
-			"    select oid, restore_list_name, 'coll' "
+			"insert or ignore into filter(catoid, oid, restore_list_name, kind) "
+			"    select (select oid from catnames where catname = 'pg_collation'),"
+			"           oid, restore_list_name, 'coll' "
 			"      from s_coll ";
 
 		if (!catalog_sql_prepare(db, s_coll_sql, &query))
@@ -5656,12 +6919,15 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 
 
 /*
- * catalog_lookup_filter_by_oid fetches a  entry from our catalogs.
+ * catalog_lookup_filter_by_oid fetches a filter entry from our catalogs using
+ * the (catoid, objectOid) key that mirrors PostgreSQL's own (classid, objid)
+ * object identity from pg_depend.
  */
 bool
 catalog_lookup_filter_by_oid(DatabaseCatalog *catalog,
 							 CatalogFilter *result,
-							 uint32_t oid)
+							 uint32_t catalogOid,
+							 uint32_t objectOid)
 {
 	sqlite3 *db = catalog->db;
 
@@ -5672,7 +6938,78 @@ catalog_lookup_filter_by_oid(DatabaseCatalog *catalog,
 	}
 
 	char *sql =
-		"  select oid, restore_list_name, kind "
+		"  select catoid, oid, restore_list_name, kind "
+		"    from filter "
+		"   where catoid = $1 and oid = $2 ";
+
+	SQLiteQuery query = {
+		.context = result,
+		.fetchFunction = &catalog_filter_fetch
+	};
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[2] = {
+		{ BIND_PARAMETER_TYPE_INT64, "catoid", catalogOid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "oid", objectOid, NULL },
+	};
+
+	if (!catalog_sql_bind(&query, params, 2))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_filter_by_oid_only fetches a filter entry using the objectOid
+ * alone, without a catoid constraint. Used for pg_dump TOC entries that have
+ * catalogId.tableoid == 0 (such as REFRESH MATERIALIZED VIEW), where the
+ * (catoid, oid) pair is not available. PostgreSQL draws OIDs from a single
+ * counter per database, so any objectOid is unique across all system catalogs
+ * within that database, making an OID-only lookup safe in this case.
+ */
+bool
+catalog_lookup_filter_by_oid_only(DatabaseCatalog *catalog,
+								  CatalogFilter *result,
+								  uint32_t objectOid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_filter_by_oid_only: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select catoid, oid, restore_list_name, kind "
 		"    from filter "
 		"   where oid = $1 ";
 
@@ -5696,7 +7033,7 @@ catalog_lookup_filter_by_oid(DatabaseCatalog *catalog,
 
 	/* bind our parameters now */
 	BindParam params[1] = {
-		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "oid", objectOid, NULL },
 	};
 
 	if (!catalog_sql_bind(&query, params, 1))
@@ -5746,7 +7083,7 @@ catalog_lookup_filter_by_rlname(DatabaseCatalog *catalog,
 	 * SQLite error condition about "another row available".
 	 */
 	char *sql =
-		"  select oid, restore_list_name, kind "
+		"  select catoid, oid, restore_list_name, kind "
 		"    from filter "
 		"   where restore_list_name = $1 "
 		"   limit 1";
@@ -5800,7 +7137,7 @@ catalog_lookup_filter_by_rlname(DatabaseCatalog *catalog,
 
 /*
  * catalog_filter_fetch fetches a CatalogFilter entry from a SQLite ppStmt
- * result set.
+ * result set.  Column layout: 0=catoid, 1=oid, 2=restore_list_name, 3=kind.
  */
 bool
 catalog_filter_fetch(SQLiteQuery *query)
@@ -5810,17 +7147,18 @@ catalog_filter_fetch(SQLiteQuery *query)
 	/* cleanup the memory area before re-use */
 	bzero(entry, sizeof(CatalogFilter));
 
-	entry->oid = sqlite3_column_int64(query->ppStmt, 0);
+	entry->catoid = sqlite3_column_int64(query->ppStmt, 0);
+	entry->oid = sqlite3_column_int64(query->ppStmt, 1);
 
-	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
+	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
 	{
 		strlcpy(entry->restoreListName,
-				(char *) sqlite3_column_text(query->ppStmt, 1),
+				(char *) sqlite3_column_text(query->ppStmt, 2),
 				sizeof(entry->restoreListName));
 	}
 
 	strlcpy(entry->kind,
-			(char *) sqlite3_column_text(query->ppStmt, 2),
+			(char *) sqlite3_column_text(query->ppStmt, 3),
 			sizeof(entry->kind));
 
 	return true;
@@ -6018,7 +7356,7 @@ catalog_iter_s_database_init(SourceDatabaseIterator *iter)
 	}
 
 	char *sql =
-		"  select oid, datname, bytes, bytes_pretty"
+		"  select oid, datname, bytes, bytes_pretty, coalesce(snapshot, '')"
 		"    from s_database "
 		"order by datname";
 
@@ -6089,6 +7427,62 @@ catalog_s_database_fetch(SQLiteQuery *query)
 	strlcpy(dat->bytesPretty,
 			(char *) sqlite3_column_text(query->ppStmt, 3),
 			sizeof(dat->bytesPretty));
+
+	strlcpy(dat->snapshot,
+			(char *) sqlite3_column_text(query->ppStmt, 4),
+			sizeof(dat->snapshot));
+
+	return true;
+}
+
+
+/*
+ * catalog_update_s_database_snapshot stores the exported snapshot identifier
+ * for a given database in the instance catalog.  Called by the snapshot holder
+ * subprocess after it has exported a per-database REPEATABLE READ snapshot.
+ */
+bool
+catalog_update_s_database_snapshot(DatabaseCatalog *catalog,
+								   const char *datname,
+								   const char *snapshot)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_update_s_database_snapshot: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"update s_database set snapshot = $1 where datname = $2";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "snapshot", 0, (char *) snapshot },
+		{ BIND_PARAMETER_TYPE_TEXT, "datname", 0, (char *) datname }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	return true;
 }
@@ -7937,6 +9331,54 @@ catalog_delete_process(DatabaseCatalog *catalog, pid_t pid)
 
 
 /*
+ * catalog_delete_all_process_entries removes all rows from the process table.
+ * Called by each supervisor before forking workers so that stale entries from
+ * a previous run (including entries left by crashed workers or by a prior
+ * Docker container whose PID namespace has been reset) cannot interfere with
+ * resume logic or SQLite write contention checks.
+ */
+bool
+catalog_delete_all_process_entries(DatabaseCatalog *catalog)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_delete_all_process_entries: db is NULL");
+		return false;
+	}
+
+	char *sql = "delete from process";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * catalog_iter_s_table_in_copy iterates over the list of tables with a COPY
  * process in our catalogs.
  */
@@ -8015,7 +9457,7 @@ catalog_iter_s_table_in_copy_init(SourceTableIterator *iter)
 	}
 
 	char *sql =
-		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 		"         exclude_data, part_key, "
 		"         part.partcount, s.partnum, part.min, part.max "
@@ -8476,6 +9918,62 @@ catalog_sql_prepare(sqlite3 *db, const char *sql, SQLiteQuery *query)
 
 
 /*
+ * catalog_sql_prepare_cached prepares a SQLite statement and caches it by
+ * SQL pointer identity.  On a cache hit the statement is reset and ready for
+ * re-use; on a miss it is compiled and added to the cache.
+ *
+ * Callers must pass a string-literal address (not a stack buffer) as sql so
+ * pointer identity is stable across calls.
+ */
+bool
+catalog_sql_prepare_cached(DatabaseCatalog *catalog,
+						   const char *sql,
+						   SQLiteQuery *query)
+{
+	CachedStmt *entry = NULL;
+
+	HASH_FIND_PTR(catalog->stmtCache, &sql, entry);
+
+	if (entry != NULL)
+	{
+		/* cache hit: reset to initial state for re-use */
+		sqlite3_reset(entry->stmt);
+		sqlite3_clear_bindings(entry->stmt);
+
+		query->db = catalog->db;
+		query->sql = sql;
+		query->ppStmt = entry->stmt;
+		query->fromCache = true;
+
+		return true;
+	}
+
+	/* cache miss: compile and add to cache */
+	if (!catalog_sql_prepare(catalog->db, sql, query))
+	{
+		return false;
+	}
+
+	entry = (CachedStmt *) malloc(sizeof(CachedStmt));
+
+	if (entry == NULL)
+	{
+		log_error("Failed to allocate CachedStmt: out of memory");
+		return false;
+	}
+
+	entry->sql = sql;
+	entry->stmt = query->ppStmt;
+
+	HASH_ADD_PTR(catalog->stmtCache, sql, entry);
+
+	query->fromCache = true;
+
+	return true;
+}
+
+
+/*
  * catalog_sql_bind binds parameters to our SQL query before execution.
  */
 bool
@@ -8497,6 +9995,8 @@ catalog_sql_bind(SQLiteQuery *query, BindParam *params, int count)
 
 /*
  * catalog_sql_execute_once executes a query once and fetches its results.
+ * Cached statements (fromCache=true) are reset instead of finalized so they
+ * can be reused on the next call to catalog_sql_prepare_cached.
  */
 bool
 catalog_sql_execute_once(SQLiteQuery *query)
@@ -8505,6 +10005,12 @@ catalog_sql_execute_once(SQLiteQuery *query)
 	{
 		log_error("Failed to execute SQLite query, see above for details");
 		return false;
+	}
+
+	if (query->fromCache)
+	{
+		/* reset is handled by catalog_sql_prepare_cached on next use */
+		return true;
 	}
 
 	if (!catalog_sql_finalize(query))
@@ -8991,24 +10497,19 @@ catalog_iter_s_table_generated_columns_init(SourceTableIterator *iter)
 	}
 
 	char *sql =
-		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"  select t.oid, t.datname, qname, nspname, relname, amname, restore_list_name, "
 		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
 		"         exclude_data, part_key, "
 		"         (select count(1) from s_table_part p where p.oid = t.oid) "
 		"    from s_table t join s_attr a "
 
-		/*
-		 * Currently, we handle only:
-		 * - Generated columns with is_generated = 'ALWAYS' for INSERT and UPDATE
-		 * - IDENTITY columns for INSERT using "overriding system value"
-		 *
-		 * TODO: Add support for IDENTITY columns in UPDATE.
-		 * https://github.com/dimitri/pgcopydb/issues/844
-		 */
-		"       on (a.oid = t.oid and a.attisgenerated = 1) "
+		/* match tables that have generated or identity-always columns */
+		"       on (a.oid = t.oid "
+		"           and (a.attisgenerated = 1 or a.attidentity = 'a')) "
 		"       left join s_table_size ts on ts.oid = t.oid "
 		"group by t.oid "
-		"  having sum(a.attisgenerated) > 0 "
+		"  having sum(case when a.attisgenerated = 1 or a.attidentity = 'a'"
+		"                  then 1 else 0 end) > 0 "
 		"order by bytes desc";
 
 	SQLiteQuery *query = &(iter->query);
