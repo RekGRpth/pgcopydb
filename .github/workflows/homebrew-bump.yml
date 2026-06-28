@@ -3,7 +3,8 @@ name: Homebrew
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*.*'
+  workflow_dispatch:
 
 jobs:
   bump-formula:
