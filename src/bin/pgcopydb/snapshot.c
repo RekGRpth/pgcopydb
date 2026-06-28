@@ -127,6 +127,13 @@ copydb_export_snapshot(TransactionSnapshot *snapshot)
 		return false;
 	}
 
+	if (!pgsql_set_client_encoding_for_server(pgsql))
+	{
+		log_fatal("Failed to set client_encoding on the source connection, "
+				  "see above for details");
+		return false;
+	}
+
 	return true;
 }
 
@@ -210,6 +217,13 @@ copydb_set_snapshot(CopyDataSpec *copySpecs)
 		return false;
 	}
 
+	if (!pgsql_set_client_encoding_for_server(pgsql))
+	{
+		log_fatal("Failed to set client_encoding on the source connection, "
+				  "see above for details");
+		return false;
+	}
+
 	return true;
 }
 
@@ -249,15 +263,6 @@ copydb_close_snapshot(CopyDataSpec *copySpecs)
 	}
 
 	copySpecs->sourceSnapshot.state = SNAPSHOT_STATE_CLOSED;
-
-	if (snapshot->state == SNAPSHOT_STATE_EXPORTED)
-	{
-		if (!unlink_file(copySpecs->cfPaths.snfile))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
 
 	return true;
 }

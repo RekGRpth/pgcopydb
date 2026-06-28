@@ -1084,6 +1084,48 @@ pgsql_server_version(PGSQL *pgsql)
 
 
 /*
+ * pgsql_set_client_encoding_for_server overrides client_encoding to match the
+ * server encoding when the server uses SQL_ASCII.
+ *
+ * COMMON_GUC_SETTINGS forces client_encoding='UTF-8' on every connection so
+ * that data flows through pgcopydb as UTF-8. That is the right default for
+ * most migrations (e.g. SQL_ASCII → UTF-8) because it makes Postgres validate
+ * the bytes on the way out of the source.
+ *
+ * However when the source itself is SQL_ASCII the forced UTF-8 client encoding
+ * causes COPY TO STDOUT to fail for any byte that is not valid UTF-8 (e.g.
+ * 0xff), even when the target database is also SQL_ASCII and would happily
+ * store those bytes. For a SQL_ASCII source we want raw bytes to pass through
+ * unchanged; the target-side connection (still using client_encoding=UTF-8)
+ * will then validate the data against the target encoding, which is the right
+ * place for that check.
+ *
+ * PQparameterStatus() returns the cached value libpq received during
+ * connection setup — no extra SQL query is issued.
+ */
+bool
+pgsql_set_client_encoding_for_server(PGSQL *pgsql)
+{
+	const char *server_enc =
+		PQparameterStatus(pgsql->connection, "server_encoding");
+
+	if (server_enc != NULL && strcmp(server_enc, "SQL_ASCII") == 0)
+	{
+		log_notice("Source database server encoding is SQL_ASCII; "
+				   "overriding client_encoding to SQL_ASCII so that "
+				   "bytes are passed through unchanged during COPY");
+
+		if (!pgsql_execute(pgsql, "SET client_encoding = 'SQL_ASCII'"))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * pgsql_set_transaction calls SET ISOLATION LEVEl with the specific
  * transaction modes parameters.
  */
@@ -3924,6 +3966,21 @@ OutputPluginToString(StreamOutputPlugin plugin)
 
 
 /*
+ * GUC settings applied to the replication connection before issuing
+ * CREATE_REPLICATION_SLOT, so that server-level timeouts (most importantly
+ * idle_in_transaction_session_timeout) do not abort slot creation.
+ *
+ * Only applied on PG10+: PG9.6's walsender does not accept SET commands at
+ * all, so we skip this step for older servers.
+ */
+static GUC replicationSlotSettings[] = {
+	{ "statement_timeout", "0" },
+	{ "idle_in_transaction_session_timeout", "0" },
+	{ NULL, NULL }
+};
+
+
+/*
  * Send the CREATE_REPLICATION_SLOT logical replication command.
  *
  * This is a Postgres 9.6 compatibility function.
@@ -3960,6 +4017,23 @@ pgsql_create_logical_replication_slot(LogicalStreamClient *client,
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	/*
+	 * Set GUCs to clear any restrictive server-level timeouts before the slot
+	 * command.  PG9.6's walsender does not accept SET commands on replication
+	 * connections; support was added in PG10, so skip this step on older
+	 * servers.  PQserverVersion() reads the version from the connection struct
+	 * (no SQL query), so it is safe to call on a replication connection.
+	 */
+	if (PQserverVersion(pgsql->connection) >= 100000)
+	{
+		if (!pgsql_set_gucs(pgsql, replicationSlotSettings))
+		{
+			log_fatal("Failed to set our GUC settings on the source connection, "
+					  "see above for details");
+			return false;
+		}
 	}
 
 	PGresult *result = PQexec(pgsql->connection, query);
