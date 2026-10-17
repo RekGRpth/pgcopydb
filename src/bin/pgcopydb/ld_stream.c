@@ -226,15 +226,30 @@ stream_init_specs(StreamSpecs *specs,
 
 		case STREAM_PLUGIN_PGOUTPUT:
 		{
+			/*
+			 * pgoutput only emits logical-decoding Message frames (from
+			 * pg_logical_emit_message()) when the "messages" replication
+			 * option is requested at START_REPLICATION time. Without it,
+			 * Postgres core silently drops Message frames before they ever
+			 * reach the output plugin. Always request it: decoding and
+			 * applying a MESSAGE frame is itself unconditional (see
+			 * ld_pgoutput.c, ld_transform.c, ld_apply.c), gated only by the
+			 * "pgcopydb" prefix and the "ddl" envelope type, both of which
+			 * are already skip-not-error for anything else. A source that
+			 * never calls pg_logical_emit_message() sees zero behavioral
+			 * change either way.
+			 */
 			KeyVal options = {
-				.count = 2,
+				.count = 3,
 				.keywords = {
 					"proto_version",
-					"publication_names"
+					"publication_names",
+					"messages"
 				},
 				.values = {
 					"1",
-					specs->slot.publicationName
+					specs->slot.publicationName,
+					"true"
 				}
 			};
 
@@ -2421,9 +2436,16 @@ stream_create_sentinel(CopyDataSpec *copySpecs,
 
 /*
  * stream_fetch_current_source_lsn connects to the given Postgres service and
- * fetches the current WAL LSN position by calling pg_current_wal_flush_lsn
- * there, or the variant of that function that is supported by this Postgres
- * version.
+ * fetches an endpos LSN that logical decoding is guaranteed to reach, by
+ * calling pg_logical_emit_message() there and using the LSN of that message
+ * (see pgsql_emit_endpos_marker for why pg_current_wal_flush_lsn() is not
+ * used directly here anymore).
+ *
+ * This relies on all three supported output plugins tolerating a message
+ * they don't recognize instead of erroring out: the marker's envelope has
+ * "type": "endpos", which every plugin's parseMessage dispatch (ld_transform.c)
+ * logs and skips as an unrecognized type, the same way it would for a
+ * genuinely unknown type from a newer pgcopydb source.
  */
 bool
 stream_fetch_current_lsn(uint64_t *lsn,
@@ -2441,7 +2463,7 @@ stream_fetch_current_lsn(uint64_t *lsn,
 	/* limit the amount of logging of the apply process */
 	src.logSQL = false;
 
-	uint64_t flushLSN = InvalidXLogRecPtr;
+	uint64_t markerLSN = InvalidXLogRecPtr;
 
 	if (!pgsql_begin(&src))
 	{
@@ -2455,7 +2477,7 @@ stream_fetch_current_lsn(uint64_t *lsn,
 		return false;
 	}
 
-	if (!pgsql_current_wal_flush_lsn(&src, &flushLSN))
+	if (!pgsql_emit_endpos_marker(&src, &markerLSN))
 	{
 		/* errors have already been logged */
 		return false;
@@ -2467,7 +2489,7 @@ stream_fetch_current_lsn(uint64_t *lsn,
 		return false;
 	}
 
-	*lsn = flushLSN;
+	*lsn = markerLSN;
 
 	return true;
 }
