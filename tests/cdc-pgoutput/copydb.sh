@@ -35,6 +35,27 @@ pgcopydb clone --split-tables-larger-than 200kB
 kill -TERM ${COPROC_PID}
 wait ${COPROC_PID}
 
+# where the replication slot starts, to see it move when apply has not run
+slot_start=`psql -AtqX -d ${PGCOPYDB_SOURCE_PGURI} -c "select confirmed_flush_lsn from pg_replication_slots where slot_name = 'pgcopydb'"`
+
+# In a clone --follow the apply process runs from the start, waits for the
+# permission to apply, and publishes the origin progress as sentinel.replay_lsn:
+# do the same here, to be where the initial copy of the data puts the sentinel.
+SOURCEDB=`find /tmp /var/lib/postgres -name source.db -path '*schema*' 2>/dev/null | head -1`
+sqlite3 "${SOURCEDB}" "update sentinel set replay_lsn = startpos where id = 1"
+
+# the target stamps the rows it inserts, which the source does not
+psql -d ${PGCOPYDB_TARGET_PGURI} <<'EOS'
+create function full_identity_stamp() returns trigger language plpgsql
+as $$ begin new.stamp := 'target'; return new; end $$;
+
+create trigger full_identity_stamp
+ before insert on full_identity_test
+ for each row execute function full_identity_stamp();
+
+alter table full_identity_test enable always trigger full_identity_stamp;
+EOS
+
 # now that the copying is done, inject some SQL DML changes to the source
 psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/dml.sql
 psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/special-dml.sql
@@ -56,19 +77,12 @@ OUTPUTDB=$(find ${SHAREDIR} -maxdepth 1 -name '*-output.db' -type f | head -1)
 sqlite3 ${OUTPUTDB} "select count(*) as output_rows from output;"
 
 #
-# Validate that the pgoutput_col table exists and has rows.
-#
-col_rows=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
-  "select count(*) from pgoutput_col;")
-echo "pgoutput_col rows: ${col_rows}"
-test "${col_rows}" -gt 0
-
-#
-# Validate that DML rows in output have nspname/relname set and NULL message.
+# Validate that DML rows in output have their columns in the message column,
+# and nspname/relname set.
 #
 null_msg=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
-  "select count(*) from output where action in ('I','U','D','T') and message is not null;")
-echo "DML rows with non-NULL message (should be 0): ${null_msg}"
+  "select count(*) from output where action in ('I','U','D','T') and action != 'T' and message is null;")
+echo "I/U/D rows with a NULL message (should be 0): ${null_msg}"
 test "${null_msg}" -eq 0
 
 nspname_set=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
@@ -77,22 +91,20 @@ echo "DML rows with nspname set: ${nspname_set}"
 test "${nspname_set}" -gt 0
 
 #
+# The columns of a row change are encoded in the message column, one
+# <section><status><length>:<name><length>:<value> per column, the value
+# only for a status of 't'.
+#
 # Validate REPLICA IDENTITY DEFAULT DELETE (K-section):
 #   For the 'rental' DELETE, pgoutput sends a 'K' tuple with only the primary
 #   key column (rental_id) as status='t' and all other columns as status='n'.
-#   The 'n' columns must be stored in pgoutput_col but NOT used in the WHERE
-#   clause (stmt.sql must show only "WHERE rental_id = $1").
+#   The 'n' columns are stored, but NOT used in the WHERE clause (stmt.sql
+#   must show only "WHERE rental_id = $1").
 #
-k_t_cols=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
-  "select count(*) from pgoutput_col c
-   join output o on o.id = c.output_id
-   where o.action = 'D' and o.relname = 'rental'
-     and c.section = 'K' and c.status = 't';")
-k_n_cols=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
-  "select count(*) from pgoutput_col c
-   join output o on o.id = c.output_id
-   where o.action = 'D' and o.relname = 'rental'
-     and c.section = 'K' and c.status = 'n';")
+rental_delete=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
+  "select message from output where action = 'D' and relname = 'rental';")
+k_t_cols=$(echo "${rental_delete}" | grep -o 'Kt[0-9]*:' | wc -l)
+k_n_cols=$(echo "${rental_delete}" | grep -o 'Kn[0-9]*:' | wc -l)
 echo "rental DELETE K-section: status='t' cols=${k_t_cols} (should be 1), status='n' cols=${k_n_cols} (should be 6)"
 test "${k_t_cols}" -eq 1
 test "${k_n_cols}" -eq 6
@@ -100,33 +112,26 @@ test "${k_n_cols}" -eq 6
 #
 # Validate REPLICA IDENTITY FULL DELETE (O-section) with genuine NULL:
 #   For the 'address' DELETE, pgoutput sends an 'O' tuple where address2 is
-#   genuinely NULL (status='n'). That column must appear in the WHERE clause
-#   as "address2 IS NULL".
+#   genuinely NULL (status='n'). That column is stored as such, though the
+#   WHERE clause only has the primary key (see stmt.sql).
 #
 o_null_cols=$(sqlite3 -init /dev/null -noheader -list ${OUTPUTDB} \
-  "select count(*) from pgoutput_col c
-   join output o on o.id = c.output_id
-   where o.action = 'D' and o.relname = 'address'
-     and c.section = 'O' and c.name = 'address2' and c.status = 'n';")
+  "select count(*) from output
+   where action = 'D' and relname = 'address'
+     and message like '%On8:address2%';")
 echo "address DELETE O-section address2 NULL cols: ${o_null_cols} (should be > 0)"
 test "${o_null_cols}" -gt 0
 
 #
-# Validate pgoutput_col structured output.
+# Validate the columns stored in the message column.
 # If the golden file is empty (first run), capture the output as the golden file.
 # On subsequent runs, diff against the golden file.
 #
 sqlite3 -init /dev/null -json ${OUTPUTDB} \
-  "select o.action, o.nspname, o.relname, o.old_type,
-          json_group_array(
-            json_object('section',c.section,'pos',c.pos,'name',c.name,
-                        'status',c.status,'value',c.value)
-          ) as cols
-   from output o
-   left join pgoutput_col c on c.output_id = o.id
-   where o.action not in ('K','X','E','B','C')
-   group by o.id
-   order by o.id" \
+  "select action, nspname, relname, old_type, message
+   from output
+   where action in ('I','U','D','T')
+   order by id" \
   > /tmp/result.jsonl
 
 if [ -s /usr/src/pgcopydb/output.pgout ]; then
@@ -141,6 +146,15 @@ fi
 # Run prefetch again — should be a no-op (idempotent).
 #
 pgcopydb stream prefetch --resume --endpos "${lsn}" -vv
+
+#
+# The source may forget the WAL once receive has it safe in the output table,
+# before the apply process has done anything: that is what lets a long initial
+# copy run without the WAL piling up on the source.
+#
+slot_flushed=`psql -AtqX -d ${PGCOPYDB_SOURCE_PGURI} -c "select confirmed_flush_lsn > '${slot_start}'::pg_lsn from pg_replication_slots where slot_name = 'pgcopydb'"`
+echo "slot confirmed_flush_lsn moved past ${slot_start} with receive alone: ${slot_flushed}"
+test "${slot_flushed}" = "t"
 
 #
 # Allow the apply process and apply the CDC changes to the target.
@@ -172,6 +186,14 @@ tgt_count=`psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "select count(*) from actor
 
 echo "source actor count: ${src_count}, target actor count: ${tgt_count}"
 test "${src_count}" -eq "${tgt_count}"
+
+#
+# REPLICA IDENTITY FULL and a target that differs from the source: the rows
+# are located by primary key, so the UPDATE and the DELETE are applied.
+#
+full_identity=`psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "select string_agg(id || val || stamp, ',' order by id) from full_identity_test"`
+echo "full_identity_test on the target: ${full_identity}"
+test "${full_identity}" = "1Atarget,2btarget"
 
 #
 # Multi-row DELETE batching validation (issue #828).

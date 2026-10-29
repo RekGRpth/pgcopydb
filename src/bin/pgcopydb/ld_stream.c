@@ -76,6 +76,8 @@ stream_init_specs(StreamSpecs *specs,
 	 */
 	specs->pipe_rt[0] = -1;
 	specs->pipe_rt[1] = -1;
+	specs->pipe_wake[0] = -1;
+	specs->pipe_wake[1] = -1;
 
 	specs->paths = *paths;
 	specs->endpos = endpos;
@@ -656,6 +658,7 @@ startLogicalStreaming(StreamSpecs *specs)
 	stream.closeFunction = &streamClose;
 	stream.feedbackFunction = &streamFeedback;
 	stream.keepaliveFunction = &streamKeepalive;
+	stream.idleFunction = &streamIdle;
 
 	/*
 	 * Read possibly already existing file to initialize the start LSN from a
@@ -913,6 +916,168 @@ streamCheckResumePosition(StreamSpecs *specs)
 
 
 /*
+ * streamBeginOutput opens the SQLite transaction that group-commits what
+ * receive writes to output.db, unless one is already open.
+ *
+ * Every insert in its own transaction means one fsync per message, and a
+ * single-row source transaction is at least three messages (BEGIN, the row,
+ * COMMIT), more with the column rows of pgoutput.  The apply process sees
+ * only committed rows, which is what it wants anyway: it starts from a
+ * transaction's COMMIT row.
+ */
+static bool
+streamBeginOutput(StreamContext *privateContext)
+{
+	DatabaseCatalog *outputDB = privateContext->outputDB;
+
+	if (catalog_in_transaction(outputDB))
+	{
+		return true;
+	}
+
+	/*
+	 * The catalog semaphore is held from here to the commit: taking it for
+	 * each insert was a system call or two per message, the single largest
+	 * cost of receiving a large transaction, and nothing else writes to
+	 * output.db.  The inserts lock it again, which costs nothing when this
+	 * process already holds it.
+	 */
+	if (!semaphore_lock(&(outputDB->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(outputDB, false))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(outputDB->sema));
+		return false;
+	}
+
+	privateContext->outputPendingMessages = 0;
+	privateContext->outputBatchStartTime = feGetCurrentTimestamp();
+
+	return true;
+}
+
+
+/*
+ * streamCommitOutput commits the open output.db transaction, if any: it makes
+ * the messages written since streamBeginOutput durable and visible to the
+ * apply process.
+ */
+static bool
+streamCommitOutput(StreamContext *privateContext)
+{
+	DatabaseCatalog *outputDB = privateContext->outputDB;
+
+	if (outputDB == NULL || !catalog_in_transaction(outputDB))
+	{
+		return true;
+	}
+
+	bool committed = catalog_commit(outputDB);
+
+	(void) semaphore_unlock(&(outputDB->sema));
+
+	if (!committed)
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	privateContext->outputPendingMessages = 0;
+
+	/* tell the apply process there is something new to look at */
+	StreamSpecs *specs = privateContext->specs;
+
+	if (specs != NULL && specs->pipe_wake[1] > 0)
+	{
+		/* a full pipe (EAGAIN) means a wake-up is already pending */
+		char bell = '!';
+		ssize_t ignored = write(specs->pipe_wake[1], &bell, 1);
+
+		(void) ignored;
+	}
+
+	return true;
+}
+
+
+/*
+ * streamCommitOutputIfDue is called after each message written to output.db.
+ * Receive commits when the stream runs dry (streamIdle) and at flush time
+ * (streamFlush); this adds the two bounds that matter when the source keeps
+ * sending: how many messages a commit may cover, and how long the apply
+ * process may wait to see the first of them.  The age is only checked at a
+ * transaction boundary, so the usual commit does not split a transaction.
+ */
+static bool
+streamCommitOutputIfDue(StreamContext *privateContext, bool txnBoundary)
+{
+	privateContext->outputPendingMessages++;
+
+	if (privateContext->outputPendingMessages >= STREAM_OUTPUT_BATCH_MAX_MESSAGES)
+	{
+		return streamCommitOutput(privateContext);
+	}
+
+	if (txnBoundary &&
+		feTimestampDifferenceExceeds(privateContext->outputBatchStartTime,
+									 feGetCurrentTimestamp(),
+									 STREAM_OUTPUT_BATCH_MAX_AGE_MS))
+	{
+		return streamCommitOutput(privateContext);
+	}
+
+	return true;
+}
+
+
+/*
+ * streamSyncOutput makes what output.db has committed so far durable: the
+ * commits do not wait for the disk (synchronous = NORMAL), and a checkpoint
+ * syncs the WAL file first. It returns false when that did not work, and then
+ * the position is not reported to the source as flushed yet.
+ */
+static bool
+streamSyncOutput(StreamContext *privateContext)
+{
+	DatabaseCatalog *outputDB = privateContext->outputDB;
+
+	if (outputDB == NULL || outputDB->db == NULL)
+	{
+		return true;
+	}
+
+	if (!catalog_execute(outputDB, "PRAGMA wal_checkpoint(PASSIVE)"))
+	{
+		log_warn("Failed to sync output.db, not reporting the flushed position");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * streamIdle is a callback function for our LogicalStreamClient.
+ *
+ * This function is called when there is no message left to read: a batch that
+ * is not full has nothing to wait for, so commit it now rather than leave the
+ * apply process without it until the next message arrives.
+ */
+bool
+streamIdle(LogicalStreamContext *context)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
+
+	return streamCommitOutput(privateContext);
+}
+
+
+/*
  * streamWrite is a callback function for our LogicalStreamClient.
  *
  * This function is called for each message received in pgsql_stream_logical.
@@ -951,23 +1116,21 @@ streamWrite(LogicalStreamContext *context)
 			 * After a transient reconnect do NOT delete partial rows for the
 			 * in-progress transaction.
 			 *
-			 * Previously this path deleted partial rows assuming "the slot
-			 * will re-deliver the entire transaction from its BEGIN on the
-			 * new connection."  That assumption fails when flush_lsn (now
-			 * tied to transform_lsn, not written_lsn) has already advanced
-			 * past the transaction's BEGIN lsn: the slot starts from
-			 * confirmed_flush > BEGIN lsn and therefore never re-sends the
-			 * BEGIN, leaving orphaned DML rows without a matching BEGIN in
-			 * the output table.
-			 *
-			 * With flush_lsn = transform_lsn and INSERT OR REPLACE semantics
-			 * on the output table the partial rows from the previous
-			 * connection are safely completed by the re-delivered messages:
-			 * the BEGIN is already in the table (or will be re-inserted
-			 * idempotently if confirmed_flush < BEGIN lsn), and any
-			 * re-delivered DML/COMMIT rows are upserted without duplication.
+			 * The server sends again every transaction whose COMMIT comes
+			 * after confirmed_flush, from its BEGIN, even when
+			 * confirmed_flush fell inside it. The partial rows from the
+			 * previous connection are then completed by the re-delivered
+			 * messages: INSERT OR REPLACE on the output table upserts
+			 * the BEGIN, the DML and the COMMIT rows without duplication.
 			 */
 			context->onRetry = false;
+		}
+
+		/* group the inserts into one transaction, see streamBeginOutput */
+		if (!streamBeginOutput(privateContext))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 
 		/* insert the message to our current SQLite logical decoding file */
@@ -988,6 +1151,15 @@ streamWrite(LogicalStreamContext *context)
 				/* errors have already been logged */
 				return false;
 			}
+		}
+
+		bool txnBoundary = metadata->action == STREAM_ACTION_COMMIT ||
+						   metadata->action == STREAM_ACTION_ROLLBACK;
+
+		if (!streamCommitOutputIfDue(privateContext, txnBoundary))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 	}
 
@@ -1053,6 +1225,13 @@ streamWrite(LogicalStreamContext *context)
 						 specs->outputDB->dbfile,
 						 (long long) st.st_size,
 						 (unsigned long long) specs->maxReplayDBSize);
+
+				/* nothing may stay uncommitted in the file we are leaving */
+				if (!streamCommitOutput(privateContext))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 
 				if (!ld_store_rotate_outputdb(specs,
 											  context->cur_record_lsn))
@@ -1300,18 +1479,11 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 	/*
 	 * Do NOT delete partial transaction rows when aborting.
 	 *
-	 * Previously this deleted the in-progress transaction's rows so the
-	 * "slot re-delivers from BEGIN on reconnect" assumption held.  That
-	 * assumption breaks when flush_lsn (= transform_lsn) has already advanced
-	 * past the transaction's BEGIN lsn: the slot starts from confirmed_flush
-	 * and never re-delivers the BEGIN, leaving orphaned DML rows.
-	 *
-	 * With flush_lsn = transform_lsn the slot always re-delivers from
-	 * transform_lsn (a transaction boundary).  Partial rows already in the
-	 * output table are completed by re-delivered messages via INSERT OR
-	 * REPLACE; the BEGIN row is either already present (BEGIN lsn <
-	 * transform_lsn) or will be re-inserted (BEGIN lsn >= transform_lsn).
-	 * No deletion is needed or safe.
+	 * The server sends again every transaction whose COMMIT comes after
+	 * confirmed_flush, from its BEGIN, even when confirmed_flush fell inside
+	 * it. Partial rows already in the output table are completed by the
+	 * re-delivered messages via INSERT OR REPLACE. No deletion is needed or
+	 * safe.
 	 */
 
 	log_debug("streamCloseFile: WAL epoch boundary at LSN %X/%X",
@@ -1336,8 +1508,9 @@ streamFlush(LogicalStreamContext *context)
 			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
 			  LSN_FORMAT_ARGS(context->cur_record_lsn));
 
-	/* if needed, flush our current file now (fsync) */
-	if (context->tracking->flushed_lsn < context->tracking->written_lsn)
+	bool advance = context->tracking->flushed_lsn < context->tracking->written_lsn;
+
+	if (advance)
 	{
 		/*
 		 * When it's time to flush, inject a KEEPALIVE message to make sure we
@@ -1350,7 +1523,25 @@ streamFlush(LogicalStreamContext *context)
 			/* errors have already been logged */
 			return false;
 		}
+	}
 
+	/* what was written is visible to apply only once committed */
+	if (!streamCommitOutput((StreamContext *) context->private))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * The flushed position is what the source is told it may forget: report
+	 * it once what was received up to there is safe in output.db, whether or
+	 * not apply has done anything with it. Waiting for apply made the source
+	 * keep all the WAL written since the slot was created during the initial
+	 * copy of the data, when apply does not run, and for as long as the
+	 * database being copied has no transaction to apply.
+	 */
+	if (advance && streamSyncOutput((StreamContext *) context->private))
+	{
 		context->tracking->flushed_lsn = context->tracking->written_lsn;
 
 		log_debug("Flushed up to %X/%X",
@@ -1414,11 +1605,14 @@ streamKeepalive(LogicalStreamContext *context)
 			.time = keepaliveTime
 		};
 
-		if (!ld_store_insert_internal_message(replayDB, &keepalive))
+		if (!streamBeginOutput(privateContext) ||
+			!ld_store_insert_internal_message(replayDB, &keepalive))
 		{
 			/* errors have already been logged */
 			return false;
 		}
+
+		privateContext->outputPendingMessages++;
 
 		log_trace("Inserted action KEEPALIVE for lsn %X/%X @%s",
 				  LSN_FORMAT_ARGS(keepalive.lsn),
@@ -1542,32 +1736,13 @@ stream_sync_sentinel(LogicalStreamContext *context)
 	context->tracking->applied_lsn = sentinel.replay_lsn;
 
 	/*
-	 * Report replay_lsn as the flushed position in the PostgreSQL replication
-	 * feedback message.
-	 *
-	 * PostgreSQL uses flush_lsn to advance the logical slot's confirmed_flush.
-	 * confirmed_flush is the point from which the slot re-delivers WAL on
-	 * reconnect (max(startlsn, confirmed_flush)).  Using written_lsn (the raw
-	 * WAL receive position) would race ahead of what apply has actually
-	 * committed: if receive is killed mid-segment, confirmed_flush ends up
-	 * beyond the last committed transaction, creating a gap.
-	 *
-	 * Using replay_lsn ensures confirmed_flush advances only when apply has
-	 * fully committed a transaction on the target.  On any restart the slot
-	 * re-delivers from replay_lsn, which is always a transaction boundary
-	 * (we sync replay_lsn only at COMMIT), and INSERT OR REPLACE handles
-	 * idempotent re-insertion of already-present output rows.
-	 *
-	 * write_lsn is still reported as-is (how far receive has received) for
-	 * monitoring; only flush_lsn (which drives confirmed_flush) is changed.
+	 * The flushed position reported to the source is the one streamFlush sets:
+	 * what receive has committed to output.db, not what apply has committed
+	 * on the target. replay_lsn is kept for monitoring and for endpos.
 	 */
-	if (sentinel.replay_lsn != InvalidXLogRecPtr)
-	{
-		context->tracking->flushed_lsn = sentinel.replay_lsn;
-	}
 
 	log_debug("stream_sync_sentinel: "
-			  "write_lsn %X/%X flush_lsn(=replay_lsn) %X/%X apply_lsn %X/%X "
+			  "write_lsn %X/%X flush_lsn %X/%X apply_lsn %X/%X "
 			  "startpos %X/%X endpos %X/%X apply %s",
 			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
 			  LSN_FORMAT_ARGS(context->tracking->flushed_lsn),

@@ -121,6 +121,7 @@ typedef struct LogicalMessageAttribute
 
 	bool isgenerated;        /* GENERATED ALWAYS AS (expr) stored column */
 	bool isidentityalways;   /* GENERATED ALWAYS AS IDENTITY column */
+	bool iskey;              /* primary key column, locates the row */
 } LogicalMessageAttribute;
 
 typedef struct LogicalMessageAttributeArray
@@ -359,6 +360,31 @@ typedef struct TestDecodingAttrCache
 
 
 /*
+ * KeyColumnsCache lists the primary key columns of a table, looked up in the
+ * source catalog the first time an UPDATE or DELETE targets the table. The
+ * table is keyed by its name as the statements spell it, "nspname"."relname".
+ * A table without a primary key has an empty list.
+ */
+typedef struct KeyColumn
+{
+	char attname[PG_NAMEDATALEN];
+
+	UT_hash_handle hh;           /* hashable by attname */
+} KeyColumn;
+
+
+typedef struct KeyColumnsCache
+{
+	char qname[4 * PG_NAMEDATALEN + 4];
+
+	int count;
+	KeyColumn *columns;
+
+	UT_hash_handle hh;           /* hashable by qname */
+} KeyColumnsCache;
+
+
+/*
  * TestDecodingTableCache caches the SourceTable + per-attribute lookups for
  * each table seen by the test_decoding parser. Without it, every UPDATE
  * message (for tables that lack an old-key section, i.e. REPLICA IDENTITY
@@ -417,6 +443,10 @@ typedef struct StreamContext
 
 	uint64_t lastWriteTime;
 
+	/* messages written to output.db since the last commit, see streamBeginOutput */
+	int outputPendingMessages;
+	TimestampTz outputBatchStartTime;
+
 	/* transform needs some catalog lookups (pkey, type oid) */
 	DatabaseCatalog *sourceDB;
 	DatabaseCatalog *outputDB;   /* output.db — receive writes, apply reads */
@@ -427,6 +457,9 @@ typedef struct StreamContext
 
 	/* per-table cache for the test_decoding parser hot path */
 	TestDecodingTableCache *testDecodingTableCache;
+
+	/* primary key columns of the tables UPDATE and DELETE target */
+	KeyColumnsCache *keyColumnsCache;
 
 	/* relation cache for pgoutput binary protocol */
 	PgoutputRelationCache *pgoutputRelationCache;
@@ -483,6 +516,15 @@ typedef struct StreamContext
 	 * call and exits cleanly without advancing transform_lsn to endpos.
 	 */
 	bool midTxnEndpos;
+
+	/*
+	 * The COMMIT LSN of the transaction the transform hook has just written
+	 * to replayDB, InvalidXLogRecPtr when what it wrote was a marker or a
+	 * rolled back transaction.  Cleared before each ld_store_iter_output
+	 * call, so that stream_transform_from_outputdb can tell the two apart and
+	 * carry on with the next transaction.
+	 */
+	uint64_t transformedCommitLSN;
 
 	/*
 	 * Cursor over the KEEPALIVE and SWITCH rows of outputDB, set by
@@ -553,6 +595,10 @@ typedef struct StreamApplyContext
 
 	/* target connection created in pipeline mode responsible for apply */
 	PGSQL applyPgConn;
+
+	/* the session settings last sent on applyPgConn, see stream_apply_set_gucs */
+	GUC *appliedGucs;
+	PGconn *appliedGucsConn;
 
 	/* apply needs access to the catalogs to register sentinel replay_lsn */
 	DatabaseCatalog *sourceDB;
@@ -671,6 +717,14 @@ struct StreamSpecs
 	/* STREAM_MODE_REPLAY (and other operations) requires one unix pipe */
 	int pipe_rt[2];     /* receive→apply lifecycle signal pipe */
 
+	/*
+	 * receive→apply doorbell: receive writes a byte to pipe_wake[1] after each
+	 * commit to output.db, apply waits on pipe_wake[0] when it has nothing to
+	 * do.  Both ends are non-blocking, and the byte only means "look again":
+	 * a full pipe already says so.
+	 */
+	int pipe_wake[2];
+
 	/* The previous pipe ends are connected to in/out for the sub-processes */
 	FILE *in;
 	FILE *out;
@@ -745,6 +799,7 @@ bool streamCheckResumePosition(StreamSpecs *specs);
 bool streamWrite(LogicalStreamContext *context);
 bool streamFlush(LogicalStreamContext *context);
 bool streamKeepalive(LogicalStreamContext *context);
+bool streamIdle(LogicalStreamContext *context);
 bool streamClose(LogicalStreamContext *context);
 bool streamFeedback(LogicalStreamContext *context);
 
